@@ -1,2 +1,11 @@
 work
 roof_classifier_settings.json
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+temp_status.txt
