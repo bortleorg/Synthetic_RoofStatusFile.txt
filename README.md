@@ -1,8 +1,6 @@
 # Synthetic RoofStatusFile
 
-**Synthetic RoofStatusFile** is a minimal desktop application for monitoring the state of a telescope's roll-off roof using images from a sky-facing camera. It uses basic machine learning to classify each frame as `OPEN` or `CLOSED`, and writes results to a plain text file in the format expected by ASCOM and other automation systems.
-
----
+**Synthetic RoofStatusFile** is a minimal desktop application for monitoring the state of a telescope's roll-off roof using images from a sky-facing camera. It uses basic machine learning to classify each frame as `OPEN` or `CLOSED`, and writes results to a plain text file in the format expected by ASCOM saferty monitor and other automation systems.
 
 ## How It Works
 
@@ -20,8 +18,6 @@ The log format looks like this:
 2025-06-23 11:07:47AM Roof Status: CLOSED
 ```
 
----
-
 ## Usage
 
 1. Launch the application.
@@ -33,43 +29,33 @@ The log format looks like this:
 7. Click **"Start Monitoring"** to begin automatic classification.
 8. The app will classify a new image every 60 seconds and append to the log file.
 
----
+## Installation
 
-## File Types
+### Download Pre-built Executable
 
-- Training images: `.png`
-- Model file: `.joblib`
-- Status log: Plain `.txt`, compatible with automation scripts
+The easiest way to get started is to download the latest pre-built executable from the [Releases page](https://github.com/bortleorg/Synthetic_RoofStatusFile.txt/releases).
 
----
+1. Go to the [Releases page](https://github.com/bortleorg/Synthetic_RoofStatusFile.txt/releases)
+2. Download the latest `Synthetic_RoofStatusFile.exe`
+3. Run the executable directly - no installation required!
 
-## Dependencies
+### Building from Source
 
-Install dependencies with:
-
-```bash
-pip install opencv-python scikit-learn joblib
-```
-
----
-
-## Building from Source
-
-To build a standalone `.exe`:
+If you prefer to build from source or need to modify the code:
 
 ```bash
-pyinstaller synthetic_roofstatus.py --onefile --windowed --name Synthetic_RoofStatusFile
+pip install -r requirements.txt
+pip install pyinstaller
+pyinstaller synthetic_roofstatus.spec
 ```
 
----
+The built executable will be in the `dist/` folder.
 
 ## System Requirements
 
 - Windows 10 or later
 - Python 3.11+ (only needed for building from source)
 - Minimal CPU usage (<1% when idle, fast classification)
-
----
 
 ## Notes
 

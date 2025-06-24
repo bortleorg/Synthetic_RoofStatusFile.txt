@@ -43,15 +43,32 @@ a = Analysis(
     noarchive=False,
 )
 
-# Collect all scipy and sklearn submodules
+# Collect all scipy and sklearn submodules - but be more selective to avoid issues
 from PyInstaller.utils.hooks import collect_all
-scipy_datas, scipy_binaries, scipy_hiddenimports = collect_all('scipy')
-sklearn_datas, sklearn_binaries, sklearn_hiddenimports = collect_all('sklearn')
-astropy_datas, astropy_binaries, astropy_hiddenimports = collect_all('astropy')
 
-a.datas += scipy_datas + sklearn_datas + astropy_datas
-a.binaries += scipy_binaries + sklearn_binaries + astropy_binaries
-a.hiddenimports += scipy_hiddenimports + sklearn_hiddenimports + astropy_hiddenimports
+try:
+    scipy_datas, scipy_binaries, scipy_hiddenimports = collect_all('scipy')
+    a.datas += scipy_datas
+    a.binaries += scipy_binaries
+    a.hiddenimports += scipy_hiddenimports
+except Exception as e:
+    print(f"Warning: Could not collect scipy modules: {e}")
+
+try:
+    sklearn_datas, sklearn_binaries, sklearn_hiddenimports = collect_all('sklearn')
+    a.datas += sklearn_datas
+    a.binaries += sklearn_binaries
+    a.hiddenimports += sklearn_hiddenimports
+except Exception as e:
+    print(f"Warning: Could not collect sklearn modules: {e}")
+
+try:
+    astropy_datas, astropy_binaries, astropy_hiddenimports = collect_all('astropy')
+    a.datas += astropy_datas
+    a.binaries += astropy_binaries
+    a.hiddenimports += astropy_hiddenimports
+except Exception as e:
+    print(f"Warning: Could not collect astropy modules: {e}")
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
@@ -66,7 +83,6 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    upx_exclude=[],
     runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
