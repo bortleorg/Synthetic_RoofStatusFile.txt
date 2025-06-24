@@ -11,6 +11,10 @@ import time
 from datetime import datetime
 import hashlib
 import json
+import logging
+import shutil
+import ephem
+import pytz
 try:
     from astropy.io import fits
     FITS_AVAILABLE = True
@@ -20,6 +24,14 @@ except ImportError:
 IMG_SIZE = 32
 SETTINGS_FILE = "roof_classifier_settings.json"
 
+# Twilight angle presets (standard astronomical definitions)
+TWILIGHT_PRESETS = {
+    "Sunset / Sunrise": "0.0",      # Sun at horizon
+    "Civil": "-6.0",       # Civil twilight (brightest stars visible)
+    "Nautical": "-12.0",   # Nautical twilight (horizon barely visible)
+    "Astronomical": "-18.0" # Astronomical twilight (complete darkness)
+}
+
 class RoofClassifierApp:
     def __init__(self, root):
         self.root = root
@@ -27,9 +39,22 @@ class RoofClassifierApp:
         self.model_path = tk.StringVar()
         self.monitor_path = tk.StringVar()
         self.output_path = tk.StringVar(value="RoofStatusFile.txt")
+        
+        # New configuration variables
+        self.log_enabled = tk.BooleanVar(value=False)
+        self.log_path = tk.StringVar(value="roof_classifier.log")
+        self.latitude = tk.StringVar(value="40.0")  # Default latitude
+        self.longitude = tk.StringVar(value="-74.0")  # Default longitude
+        self.sun_angle_threshold = tk.StringVar(value="-17.0")  # Default sun angle threshold
+        self.secondary_source_enabled = tk.BooleanVar(value=False)
+        self.secondary_source_path = tk.StringVar()
+        self.twilight_preset_var = tk.StringVar(value="Custom")
+        
         self.model = None
         self.stop_monitor = False
+        self.logger = None
         self.load_settings()
+        self.setup_logging()
         self.setup_gui()
 
     def load_settings(self):
@@ -41,6 +66,16 @@ class RoofClassifierApp:
                     self.model_path.set(settings.get('model_path', ''))
                     self.monitor_path.set(settings.get('monitor_path', ''))
                     self.output_path.set(settings.get('output_path', 'RoofStatusFile.txt'))
+                    
+                    # Load new settings
+                    self.log_enabled.set(settings.get('log_enabled', False))
+                    self.log_path.set(settings.get('log_path', 'roof_classifier.log'))
+                    self.latitude.set(settings.get('latitude', '40.0'))
+                    self.longitude.set(settings.get('longitude', '-74.0'))
+                    self.sun_angle_threshold.set(settings.get('sun_angle_threshold', '-17.0'))
+                    self.secondary_source_enabled.set(settings.get('secondary_source_enabled', False))
+                    self.secondary_source_path.set(settings.get('secondary_source_path', ''))
+                    self.twilight_preset_var.set(settings.get('twilight_preset', 'Custom'))
         except Exception as e:
             print(f"Error loading settings: {e}")
 
@@ -50,12 +85,129 @@ class RoofClassifierApp:
             settings = {
                 'model_path': self.model_path.get(),
                 'monitor_path': self.monitor_path.get(),
-                'output_path': self.output_path.get()
+                'output_path': self.output_path.get(),
+                'log_enabled': self.log_enabled.get(),
+                'log_path': self.log_path.get(),
+                'latitude': self.latitude.get(),
+                'longitude': self.longitude.get(),
+                'sun_angle_threshold': self.sun_angle_threshold.get(),
+                'secondary_source_enabled': self.secondary_source_enabled.get(),
+                'secondary_source_path': self.secondary_source_path.get(),
+                'twilight_preset': self.twilight_preset_var.get()
             }
             with open(SETTINGS_FILE, 'w') as f:
                 json.dump(settings, f, indent=2)
         except Exception as e:
             print(f"Error saving settings: {e}")
+
+    def setup_logging(self):
+        """Setup logging configuration"""
+        if hasattr(self, 'logger') and self.logger:
+            # Remove existing handlers
+            for handler in self.logger.handlers[:]:
+                self.logger.removeHandler(handler)
+        
+        self.logger = logging.getLogger('RoofClassifier')
+        self.logger.setLevel(logging.INFO)
+        
+        # Create formatter
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        
+        if self.log_enabled.get():
+            try:
+                # File handler
+                file_handler = logging.FileHandler(self.log_path.get())
+                file_handler.setFormatter(formatter)
+                self.logger.addHandler(file_handler)
+            except Exception as e:
+                print(f"Error setting up file logging: {e}")
+        
+        # Console handler (always enabled)
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        self.logger.addHandler(console_handler)
+
+    def calculate_sun_angle(self):
+        """Calculate the sun's elevation angle for the given location using UTC"""
+        try:
+            # Create observer for the given location
+            observer = ephem.Observer()
+            observer.lat = str(float(self.latitude.get()))
+            observer.lon = str(float(self.longitude.get()))
+            # Use UTC time for calculations
+            observer.date = ephem.now()
+            
+            # Calculate sun position
+            sun = ephem.Sun()
+            sun.compute(observer)
+            
+            # Return elevation angle in degrees
+            return float(sun.alt) * 180.0 / ephem.pi
+        except Exception as e:
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.error(f"Error calculating sun angle: {e}")
+            return 0.0  # Default to 0 if calculation fails
+
+    def is_sun_safe_for_open(self):
+        """Check if sun angle is safe to report 'open' status"""
+        try:
+            sun_angle = self.calculate_sun_angle()
+            threshold = float(self.sun_angle_threshold.get())
+            is_safe = sun_angle < threshold
+            
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.info(f"Sun angle: {sun_angle:.1f}°, Threshold: {threshold:.1f}°, Safe for open: {is_safe}")
+            
+            return is_safe
+        except Exception as e:
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.error(f"Error checking sun safety: {e}")
+            return True  # Default to safe if calculation fails
+
+    def read_secondary_source(self):
+        """Read the secondary source roof status file"""
+        if not self.secondary_source_enabled.get() or not self.secondary_source_path.get():
+            return None, None
+        
+        try:
+            file_path = self.secondary_source_path.get()
+            if not os.path.exists(file_path):
+                if hasattr(self, 'logger') and self.logger:
+                    self.logger.warning(f"Secondary source file not found: {file_path}")
+                return None, None
+            
+            # Get file modification time in UTC
+            mod_time = datetime.utcfromtimestamp(os.path.getmtime(file_path))
+            
+            # Read the last line of the file
+            with open(file_path, 'r') as f:
+                lines = f.readlines()
+                if not lines:
+                    if hasattr(self, 'logger') and self.logger:
+                        self.logger.warning(f"Secondary source file is empty: {file_path}")
+                    return None, None
+                
+                last_line = lines[-1].strip()
+                
+                # Try to parse the status from the line
+                if "OPEN" in last_line.upper():
+                    status = "OPEN"
+                elif "CLOSED" in last_line.upper():
+                    status = "CLOSED"
+                else:
+                    if hasattr(self, 'logger') and self.logger:
+                        self.logger.warning(f"Could not parse status from secondary source: {last_line}")
+                    return None, None
+                
+                if hasattr(self, 'logger') and self.logger:
+                    self.logger.info(f"Secondary source status: {status}, Last updated: {mod_time}")
+                
+                return status, mod_time
+                
+        except Exception as e:
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.error(f"Error reading secondary source: {e}")
+            return None, None
 
     def setup_gui(self):
         # Training section
@@ -123,6 +275,80 @@ class RoofClassifierApp:
         self.status_label.pack()
         self.countdown_label = tk.Label(status_frame, text="", fg="blue")
         self.countdown_label.pack()
+
+        # Configuration section
+        config_frame = tk.LabelFrame(self.root, text="Configuration", padx=5, pady=5)
+        config_frame.pack(fill="x", padx=10, pady=5)
+        
+        # Logging configuration
+        log_frame = tk.Frame(config_frame)
+        log_frame.pack(fill="x", pady=2)
+        
+        log_checkbox = tk.Checkbutton(log_frame, text="Enable Logging to File", 
+                                     variable=self.log_enabled, command=self.on_log_enabled_changed)
+        log_checkbox.pack(side=tk.LEFT)
+        
+        log_path_frame = tk.Frame(log_frame)
+        log_path_frame.pack(side=tk.RIGHT, fill="x", expand=True, padx=(10,0))
+        tk.Entry(log_path_frame, textvariable=self.log_path, width=30).pack(side=tk.LEFT, fill="x", expand=True)
+        tk.Button(log_path_frame, text="Browse...", command=self.browse_log_file).pack(side=tk.RIGHT, padx=(5,0))
+        
+        # Observatory location
+        location_frame = tk.Frame(config_frame)
+        location_frame.pack(fill="x", pady=2)
+        tk.Label(location_frame, text="Observatory Location:").pack(side=tk.LEFT)
+        tk.Label(location_frame, text="Lat:").pack(side=tk.LEFT, padx=(10,0))
+        tk.Entry(location_frame, textvariable=self.latitude, width=8).pack(side=tk.LEFT, padx=(2,5))
+        tk.Label(location_frame, text="Lon:").pack(side=tk.LEFT)
+        tk.Entry(location_frame, textvariable=self.longitude, width=8).pack(side=tk.LEFT, padx=(2,5))
+        
+        # Twilight threshold configuration
+        twilight_frame = tk.Frame(config_frame)
+        twilight_frame.pack(fill="x", pady=2)
+        tk.Label(twilight_frame, text="Sun Angle Threshold:").pack(side=tk.LEFT)
+        
+        # Manual threshold entry
+        tk.Entry(twilight_frame, textvariable=self.sun_angle_threshold, width=6).pack(side=tk.LEFT, padx=(2,0))
+        tk.Label(twilight_frame, text="°").pack(side=tk.LEFT)
+        
+        # Twilight presets
+        preset_frame = tk.Frame(config_frame)
+        preset_frame.pack(fill="x", pady=2)
+        tk.Label(preset_frame, text="Presets:").pack(side=tk.LEFT)
+        for preset_name in TWILIGHT_PRESETS.keys():
+            tk.Button(preset_frame, text=preset_name, 
+                     command=lambda p=preset_name: self.apply_twilight_preset(p)).pack(side=tk.LEFT, padx=2)
+        
+
+        # Observation window display
+        window_frame = tk.Frame(config_frame)
+        window_frame.pack(fill="x", pady=5)
+        self.obs_window_label = tk.Label(window_frame, text="Calculating observation window...", 
+                                   fg="darkgreen", justify=tk.LEFT, font=("Arial", 9))
+        self.obs_window_label.pack(side=tk.LEFT)
+        tk.Button(window_frame, text="Refresh", command=self.update_observation_window_display).pack(side=tk.RIGHT)
+        
+        # UTC time note
+        utc_note_frame = tk.Frame(config_frame)
+        utc_note_frame.pack(fill="x", pady=2)
+        tk.Label(utc_note_frame, text="All times UTC", 
+                fg="gray", font=("Arial", 8)).pack(anchor="w")
+        
+        # Update window display after GUI is set up
+        self.root.after(1000, self.update_observation_window_display)
+
+        # Secondary source
+        secondary_frame = tk.Frame(config_frame)
+        secondary_frame.pack(fill="x", pady=2)
+        
+        secondary_checkbox = tk.Checkbutton(secondary_frame, text="Monitor Secondary Roof Status File", 
+                                          variable=self.secondary_source_enabled)
+        secondary_checkbox.pack(side=tk.LEFT)
+        
+        secondary_path_frame = tk.Frame(secondary_frame)
+        secondary_path_frame.pack(side=tk.RIGHT, fill="x", expand=True, padx=(10,0))
+        tk.Entry(secondary_path_frame, textvariable=self.secondary_source_path, width=30).pack(side=tk.LEFT, fill="x", expand=True)
+        tk.Button(secondary_path_frame, text="Browse...", command=self.browse_secondary_source).pack(side=tk.RIGHT, padx=(5,0))
 
         # Utilities section
         utils_frame = tk.LabelFrame(self.root, text="Utilities", padx=5, pady=5)
@@ -361,26 +587,75 @@ class RoofClassifierApp:
     def classify_latest_png(self):
         folder = self.monitor_path.get()
         if not self.model or not os.path.isdir(folder):
+            if self.logger:
+                self.logger.error("No model loaded or invalid monitor folder")
             return None, "No model or invalid folder"
+        
         pngs = [f for f in os.listdir(folder) if f.lower().endswith(".png")]
         if not pngs:
+            if self.logger:
+                self.logger.warning("No PNG files found in monitor folder")
             return None, "No PNG files found"
+        
         latest = max(pngs, key=lambda f: os.path.getmtime(os.path.join(folder, f)))
         img_path = os.path.join(folder, latest)
+        
+        # Get secondary source status for comparison
+        secondary_status, secondary_time = self.read_secondary_source()
+        
+        # Classify the image
         img = self.prep_image(img_path).flatten().reshape(1, -1)
         pred = self.model.predict(img)[0]
-        status = "OPEN" if pred == 1 else "CLOSED"
-        now = datetime.now().strftime("%Y-%m-%d %I:%M:%S%p")
-        line = f"{now} Roof Status: {status}\n"
+        image_status = "OPEN" if pred == 1 else "CLOSED"
+        
+        # Apply sun angle guard rails
+        sun_safe = self.is_sun_safe_for_open()
+        if image_status == "OPEN" and not sun_safe:
+            if self.logger:
+                self.logger.warning(f"Image classification suggests OPEN, but sun angle too high - overriding to CLOSED")
+            final_status = "CLOSED"
+            override_reason = " (Sun too high - safety override)"
+        else:
+            final_status = image_status
+            override_reason = ""
+        
+        # Log the analysis
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        sun_angle = self.calculate_sun_angle()
+        
+        log_message = f"Image: {latest}, Raw prediction: {image_status}, Final status: {final_status}"
+        log_message += f", Sun angle: {sun_angle:.1f}°"
+        
+        if secondary_status:
+            log_message += f", Secondary source: {secondary_status} (updated: {secondary_time})"
+        else:
+            log_message += ", Secondary source: Not available"
+        
+        if self.logger:
+            self.logger.info(log_message)
+        
+        # Write to output file
+        line = f"{now} Roof Status: {final_status}{override_reason}\n"
         with open(self.output_path.get(), "a") as f:
             f.write(line)
-        print(f"[{status}] {latest}")
-        return latest, status
+        
+        print(f"[{final_status}] {latest}")
+        return latest, final_status
 
     def update_monitoring_status(self, filename, status):
         """Update the monitoring status display"""
         if filename and status:
-            self.status_label.config(text=f"Last checked: {filename} → {status}", fg="green")
+            # Get secondary source info for display
+            secondary_status, secondary_time = self.read_secondary_source()
+            
+            status_text = f"Last checked: {filename} → {status}"
+            if secondary_status:
+                time_str = secondary_time.strftime("%H:%M:%S UTC") if secondary_time else "Unknown"
+                status_text += f" | Secondary: {secondary_status} ({time_str})"
+            else:
+                status_text += " | Secondary: N/A"
+            
+            self.status_label.config(text=status_text, fg="green")
         else:
             self.status_label.config(text="Monitoring: Error checking files", fg="red")
 
@@ -388,8 +663,14 @@ class RoofClassifierApp:
         """Update the countdown display"""
         if seconds_remaining > 0:
             self.countdown_label.config(text=f"Next check in: {seconds_remaining}s")
+            
+            # Update observation window display every 5 minutes (300 seconds)
+            if seconds_remaining % 300 == 0:
+                self.update_observation_window_display()
         else:
             self.countdown_label.config(text="Checking now...")
+            # Update observation window when checking
+            self.update_observation_window_display()
 
     def clear_monitoring_status(self):
         """Clear the monitoring status when stopped"""
@@ -418,14 +699,40 @@ class RoofClassifierApp:
         if not self.model:
             messagebox.showerror("Error", "Load or train a model first.")
             return
+        
+        # Validate configuration
+        try:
+            float(self.latitude.get())
+            float(self.longitude.get())
+            float(self.sun_angle_threshold.get())
+        except ValueError:
+            messagebox.showerror("Error", "Please enter valid numeric values for latitude, longitude, and sun angle threshold.")
+            return
+        
+        # Setup logging with current settings
+        self.setup_logging()
+        
         self.stop_monitor = False
         self.status_label.config(text="Monitoring: Starting...", fg="blue")
         self.countdown_label.config(text="")
+        
+        if self.logger:
+            self.logger.info("Monitoring started")
+            self.logger.info(f"Observatory location: {self.latitude.get()}°, {self.longitude.get()}°")
+            self.logger.info(f"Sun angle threshold: {self.sun_angle_threshold.get()}°")
+            if self.secondary_source_enabled.get():
+                self.logger.info(f"Secondary source enabled: {self.secondary_source_path.get()}")
+            else:
+                self.logger.info("Secondary source disabled")
+        
         threading.Thread(target=self.monitor_loop, daemon=True).start()
+        self.update_observation_window_display()  # Start periodic updates
         messagebox.showinfo("Started", "Monitoring started.")
 
     def stop_monitoring(self):
         self.stop_monitor = True
+        if self.logger:
+            self.logger.info("Monitoring stopped")
         messagebox.showinfo("Stopped", "Monitoring stopped.")
 
     def browse_model_path(self):
@@ -488,7 +795,7 @@ class RoofClassifierApp:
             defaultextension=".txt",
             filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
             initialdir=initial_dir,
-            initialvalue=os.path.basename(current_path) if current_path else "RoofStatusFile.txt"
+            initialfile=os.path.basename(current_path) if current_path else "RoofStatusFile.txt"
         )
         if path:
             self.output_path.set(path)
@@ -863,14 +1170,255 @@ class RoofClassifierApp:
             else:
                 return (data - data_min) / (data_max - data_min)
 
+    def on_log_enabled_changed(self):
+        """Called when logging checkbox is toggled"""
+        self.setup_logging()
+        self.save_settings()
+
+    def browse_log_file(self):
+        """Browse for log file destination"""
+        current_path = self.log_path.get()
+        initial_dir = os.path.dirname(current_path) if current_path else os.getcwd()
+        path = filedialog.asksaveasfilename(
+            title="Select Log File Location",
+            defaultextension=".log",
+            filetypes=[("Log files", "*.log"), ("Text files", "*.txt"), ("All files", "*.*")],
+            initialdir=initial_dir
+        )
+        if path:
+            self.log_path.set(path)
+            self.setup_logging()
+            self.save_settings()
+
+    def browse_secondary_source(self):
+        """Browse for secondary source roof status file"""
+        current_path = self.secondary_source_path.get()
+        initial_dir = os.path.dirname(current_path) if current_path else os.getcwd()
+        path = filedialog.askopenfilename(
+            title="Select Secondary Roof Status File",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            initialdir=initial_dir
+        )
+        if path:
+            self.secondary_source_path.set(path)
+            self.save_settings()
+
+    def calculate_next_observation_window(self):
+        """Calculate the next safe observation window (when sun is below threshold)"""
+        try:
+            # Create observer for the given location
+            observer = ephem.Observer()
+            observer.lat = str(float(self.latitude.get()) * ephem.degree_per_degree)
+            observer.lon = str(float(self.longitude.get()) * ephem.degree_per_degree)
+            
+            # Get threshold angle in radians
+            threshold_deg = float(self.sun_angle_threshold.get())
+            threshold_rad = threshold_deg * ephem.pi / 180.0
+            
+            # Create sun object
+            sun = ephem.Sun()
+            
+            # Start from current time
+            observer.date = ephem.now()
+            current_time = observer.date
+            
+            # Calculate current sun angle
+            sun.compute(observer)
+            current_angle = float(sun.alt) * 180.0 / ephem.pi
+            
+            # If we're already in a safe window, find when it ends
+            if current_angle < threshold_deg:
+                try:
+                    # Find when sun rises above threshold (end of current window)
+                    end_time = observer.next_setting(sun, start=current_time)
+                    # Actually, we want when it rises above our threshold, not just sets
+                    # Let's search forward in small increments
+                    search_time = current_time
+                    while search_time < current_time + 1:  # Search up to 24 hours ahead
+                        observer.date = search_time
+                        sun.compute(observer)
+                        if float(sun.alt) * 180.0 / ephem.pi > threshold_deg:
+                            end_time = search_time
+                            break
+                        search_time += ephem.minute * 30  # Search in 30-minute increments
+                    
+                    # Find start of next window (when sun goes below threshold again)
+                    search_time = end_time
+                    start_next = None
+                    while search_time < current_time + 2:  # Search up to 48 hours ahead
+                        observer.date = search_time
+                        sun.compute(observer)
+                        if float(sun.alt) * 180.0 / ephem.pi < threshold_deg:
+                            start_next = search_time
+                            break
+                        search_time += ephem.minute * 30
+                    
+                    if start_next:
+                        # Find end of next window
+                        search_time = start_next + ephem.minute * 30
+                        end_next = None
+                        while search_time < start_next + 1:
+                            observer.date = search_time
+                            sun.compute(observer)
+                            if float(sun.alt) * 180.0 / ephem.pi > threshold_deg:
+                                end_next = search_time
+                                break
+                            search_time += ephem.minute * 30
+                        
+                        # Return current window end and next window
+                        return {
+                            'current_end': end_time,
+                            'next_start': start_next,
+                            'next_end': end_next,
+                            'in_window': True
+                        }
+                    
+                except ephem.AlwaysUpError:
+                    # Sun never sets (polar summer)
+                    return {'error': 'Sun never sets at this location/time'}
+                except ephem.NeverUpError:
+                    # Sun never rises (polar winter) - always safe
+                    return {'always_safe': True}
+            else:
+                # We're not in a safe window, find when the next one starts
+                search_time = current_time
+                start_next = None
+                while search_time < current_time + 2:  # Search up to 48 hours ahead
+                    observer.date = search_time
+                    sun.compute(observer)
+                    if float(sun.alt) * 180.0 / ephem.pi < threshold_deg:
+                        start_next = search_time
+                        break
+                    search_time += ephem.minute * 30
+                
+                if start_next:
+                    # Find end of next window
+                    search_time = start_next + ephem.minute * 30
+                    end_next = None
+                    while search_time < start_next + 1:
+                        observer.date = search_time
+                        sun.compute(observer)
+                        if float(sun.alt) * 180.0 / ephem.pi > threshold_deg:
+                            end_next = search_time
+                            break
+                        search_time += ephem.minute * 30
+                    
+                    return {
+                        'next_start': start_next,
+                        'next_end': end_next,
+                        'in_window': False
+                    }
+                
+                return {'error': 'No safe observation window found in next 48 hours'}
+                
+        except Exception as e:
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.error(f"Error calculating observation window: {e}")
+            return {'error': str(e)}
+
+    def calculate_observation_window(self):
+        """Calculate the next observation window (when it's safe to report 'open') using UTC"""
+        try:
+            observer = ephem.Observer()
+            observer.lat = str(float(self.latitude.get()))
+            observer.lon = str(float(self.longitude.get()))
+            threshold = float(self.sun_angle_threshold.get())
+            
+            sun = ephem.Sun()
+            
+            # Start checking from current UTC time
+            current_time = ephem.now()  # PyEphem uses UTC by default
+            observer.date = current_time
+            
+            # Check current sun position
+            sun.compute(observer)
+            current_sun_angle = float(sun.alt) * 180.0 / ephem.pi
+            
+            # If currently safe, find when it becomes unsafe
+            if current_sun_angle < threshold:
+                # Find when sun rises above threshold (end of current window)
+                try:
+                    observer.horizon = str(threshold)
+                    next_sunrise = observer.next_rising(sun)
+                    window_end = next_sunrise
+                except:
+                    window_end = None  # Never rises above threshold
+                
+                # Find start of next window (sun sets below threshold)
+                try:
+                    next_sunset = observer.next_setting(sun)
+                    next_window_start = next_sunset
+                except:
+                    next_window_start = None  # Never sets below threshold
+                
+                return None, window_end, next_window_start
+            
+            else:
+                # Currently unsafe, find when it becomes safe
+                try:
+                    observer.horizon = str(threshold)
+                    next_sunset = observer.next_setting(sun)
+                    window_start = next_sunset
+                    
+                    # Find end of this window
+                    observer.date = next_sunset
+                    next_sunrise = observer.next_rising(sun)
+                    window_end = next_sunrise
+                    
+                    return window_start, window_end, None
+                    
+                except:
+                    # Never safe at this location/threshold
+                    return "Never", "Never", "Never"
+                    
+        except Exception as e:
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.error(f"Error calculating observation window: {e}")
+            return None, None, None
+
+    def format_observation_window(self):
+        """Format the observation window for display (times shown in UTC)"""
+        try:
+            window_start, window_end, next_window_start = self.calculate_observation_window()
+            
+            if window_start == "Never":
+                return "Observation Window: Never safe at this location/time"
+            elif window_start is None and window_end is None:
+                return "Observation Window: Always safe at this location/time"
+            elif window_start is None:
+                # Currently in safe window
+                end_str = datetime.strptime(str(window_end), "%Y/%m/%d %H:%M:%S").strftime("%H:%M UTC") if window_end else "Unknown"
+                next_str = datetime.strptime(str(next_window_start), "%Y/%m/%d %H:%M:%S").strftime("%H:%M UTC") if next_window_start else "Unknown"
+                return f"Current Window: Now → {end_str} | Next: {next_str} → ..."
+            else:
+                # Waiting for next window
+                start_str = datetime.strptime(str(window_start), "%Y/%m/%d %H:%M:%S").strftime("%H:%M UTC") if window_start else "Unknown"
+                end_str = datetime.strptime(str(window_end), "%Y/%m/%d %H:%M:%S").strftime("%H:%M UTC") if window_end else "Unknown"
+                return f"Next Window: {start_str} → {end_str}"
+                
+        except Exception as e:
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.error(f"Error formatting observation window: {e}")
+            return "Observation Window: Error calculating"
+
+    def update_observation_window_display(self):
+        """Update the observation window display"""
+        if hasattr(self, 'obs_window_label'):
+            self.obs_window_label.config(text=self.format_observation_window())
+        # Schedule next update in 60 seconds if monitoring
+        if not self.stop_monitor:
+            self.root.after(60000, self.update_observation_window_display)
+
+    def apply_twilight_preset(self, preset_name):
+        """Apply a twilight preset to the sun angle threshold"""
+        if preset_name in TWILIGHT_PRESETS:
+            self.sun_angle_threshold.set(TWILIGHT_PRESETS[preset_name])
+            self.save_settings()
+            self.update_observation_window_display()
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.info(f"Applied twilight preset: {preset_name} ({TWILIGHT_PRESETS[preset_name]}°)")
+
 if __name__ == "__main__":
     root = tk.Tk()
     app = RoofClassifierApp(root)
-    
-    # Save settings when the application closes
-    def on_closing():
-        app.save_settings()
-        root.destroy()
-    
-    root.protocol("WM_DELETE_WINDOW", on_closing)
     root.mainloop()
