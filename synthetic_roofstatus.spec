@@ -61,7 +61,6 @@ exe = EXE(
     a.binaries,
     a.zipfiles,
     a.datas,
-    [],
     name='Synthetic_RoofStatusFile',
     debug=False,
     bootloader_ignore_signals=False,
