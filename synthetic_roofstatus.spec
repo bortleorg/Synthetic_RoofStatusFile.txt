@@ -8,67 +8,83 @@ a = Analysis(
     binaries=[],
     datas=[],
     hiddenimports=[
+        # Core dependencies - only include what we actually use
         'ephem',
         'pytz',
-        'astropy',
-        'astropy.io',
         'astropy.io.fits',
-        'scipy',
-        'scipy.sparse',
-        'scipy.sparse.csgraph',
-        'scipy.sparse._matrix',
-        'scipy.sparse._sparsetools',
-        'scipy.sparse._csparsetools',
-        'scipy._lib',
-        'scipy._lib._ccallback_c',
-        'scipy.special',
-        'scipy.special._ufuncs_cxx',
-        'sklearn',
-        'sklearn.utils._cython_blas',
-        'sklearn.neighbors.typedefs',
-        'sklearn.neighbors.quad_tree',
-        'sklearn.tree._utils',
-        'sklearn.ensemble._gradient_boosting',
-        'sklearn.linear_model',
         'sklearn.linear_model._logistic',
-        'sklearn.metrics',
+        'sklearn.preprocessing._data',
+        'sklearn.metrics._classification',
+        'sklearn.utils._weight_vector',
+        'sklearn.utils._random',
+        'joblib',
+        'cv2',
+        'numpy',
+        # TKinter related
+        'tkinter',
+        'tkinter.filedialog',
+        'tkinter.messagebox',
+        'tkinter.ttk',
     ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        # Exclude problematic optional dependencies
+        'torch',
+        'matplotlib',
+        'scipy._lib.array_api_compat.torch',
+        'sklearn.externals.array_api_compat.torch',
+        'astropy.visualization.wcsaxes',
+    ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
     noarchive=False,
 )
 
-# Collect all scipy and sklearn submodules - but be more selective to avoid issues
-from PyInstaller.utils.hooks import collect_all
-
+# Only collect essential sklearn modules to avoid dependency issues
 try:
-    scipy_datas, scipy_binaries, scipy_hiddenimports = collect_all('scipy')
-    a.datas += scipy_datas
-    a.binaries += scipy_binaries
-    a.hiddenimports += scipy_hiddenimports
-except Exception as e:
-    print(f"Warning: Could not collect scipy modules: {e}")
-
-try:
-    sklearn_datas, sklearn_binaries, sklearn_hiddenimports = collect_all('sklearn')
-    a.datas += sklearn_datas
-    a.binaries += sklearn_binaries
-    a.hiddenimports += sklearn_hiddenimports
+    from PyInstaller.utils.hooks import collect_submodules
+    # Only get the specific sklearn modules we need
+    sklearn_modules = [
+        'sklearn.linear_model',
+        'sklearn.preprocessing', 
+        'sklearn.metrics',
+        'sklearn.utils',
+        'sklearn.base'
+    ]
+    for module in sklearn_modules:
+        try:
+            submodules = collect_submodules(module)
+            a.hiddenimports.extend(submodules)
+            print(f"Collected {module}")
+        except Exception as e:
+            print(f"Warning: Could not collect {module}: {e}")
 except Exception as e:
     print(f"Warning: Could not collect sklearn modules: {e}")
 
-try:
-    astropy_datas, astropy_binaries, astropy_hiddenimports = collect_all('astropy')
-    a.datas += astropy_datas
-    a.binaries += astropy_binaries
-    a.hiddenimports += astropy_hiddenimports
-except Exception as e:
-    print(f"Warning: Could not collect astropy modules: {e}")
+pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    name='Synthetic_RoofStatusFile',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    runtime_tmpdir=None,
+    console=False,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+)
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 

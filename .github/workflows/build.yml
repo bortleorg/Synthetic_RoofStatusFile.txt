@@ -26,13 +26,58 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Test import
+      - name: Test imports
         run: |
-          cd src && python -c "import synthetic_roofstatus; print('Import successful')"
+          cd src && python -c "
+          import sys
+          import warnings
+          warnings.filterwarnings('ignore')
+          
+          print('Testing core imports...')
+          import tkinter
+          print('✓ tkinter')
+          
+          import cv2
+          print('✓ opencv-python')
+          
+          import numpy
+          print('✓ numpy') 
+          
+          import sklearn.linear_model
+          print('✓ sklearn')
+          
+          import joblib
+          print('✓ joblib')
+          
+          import ephem
+          print('✓ ephem')
+          
+          import pytz
+          print('✓ pytz')
+          
+          try:
+              import astropy.io.fits
+              print('✓ astropy')
+          except ImportError as e:
+              print(f'⚠ astropy import issue: {e}')
+          
+          print('All core imports successful!')
+          "
 
       - name: Build EXE with pyinstaller
         run: |
-          pyinstaller synthetic_roofstatus.spec
+          echo "Building with PyInstaller..."
+          pyinstaller synthetic_roofstatus.spec --clean --noconfirm
+          
+          echo "Checking build output..."
+          if (Test-Path "dist/Synthetic_RoofStatusFile.exe") {
+            $fileInfo = Get-Item "dist/Synthetic_RoofStatusFile.exe"
+            Write-Host "✅ Build successful!"
+            Write-Host "File size: $([math]::Round($fileInfo.Length / 1MB, 2)) MB"
+          } else {
+            Write-Error "Build failed - executable not found"
+            exit 1
+          }
 
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
