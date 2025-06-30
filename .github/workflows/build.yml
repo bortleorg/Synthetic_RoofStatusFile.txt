@@ -35,31 +35,31 @@ jobs:
           
           print('Testing core imports...')
           import tkinter
-          print('✓ tkinter')
+          print('[OK] tkinter')
           
           import cv2
-          print('✓ opencv-python')
+          print('[OK] opencv-python')
           
           import numpy
-          print('✓ numpy') 
+          print('[OK] numpy') 
           
           import sklearn.linear_model
-          print('✓ sklearn')
+          print('[OK] sklearn')
           
           import joblib
-          print('✓ joblib')
+          print('[OK] joblib')
           
           import ephem
-          print('✓ ephem')
+          print('[OK] ephem')
           
           import pytz
-          print('✓ pytz')
+          print('[OK] pytz')
           
           try:
               import astropy.io.fits
-              print('✓ astropy')
+              print('[OK] astropy')
           except ImportError as e:
-              print(f'⚠ astropy import issue: {e}')
+              print(f'[WARN] astropy import issue: {e}')
           
           print('All core imports successful!')
           "
@@ -72,7 +72,7 @@ jobs:
           echo "Checking build output..."
           if (Test-Path "dist/Synthetic_RoofStatusFile.exe") {
             $fileInfo = Get-Item "dist/Synthetic_RoofStatusFile.exe"
-            Write-Host "✅ Build successful!"
+            Write-Host "[SUCCESS] Build completed!"
             Write-Host "File size: $([math]::Round($fileInfo.Length / 1MB, 2)) MB"
           } else {
             Write-Error "Build failed - executable not found"
