@@ -25,8 +25,24 @@ a = Analysis(
         'tkinter.filedialog',
         'tkinter.messagebox',
         'tkinter.ttk',
+        # Scipy compiled extensions that are often missed
+        'scipy._lib._ccallback_c',
+        'scipy._cyutility',
+        'scipy.sparse._sparsetools',
+        'scipy.sparse._csparsetools',
+        'scipy.sparse.csgraph._validation',
+        'scipy.special._ufuncs_cxx',
+        'scipy.special._ellip_harm_2',
+        # Additional sklearn dependencies
+        'sklearn.utils._cython_blas',
+        'sklearn.utils._seq_dataset',
+        'sklearn.utils._random',
+        'sklearn.utils._weight_vector',
+        'sklearn.neighbors._typedefs',
+        'sklearn.neighbors._quad_tree',
+        'sklearn.tree._utils',
     ],
-    hookspath=[],
+    hookspath=['hooks'],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
@@ -36,6 +52,26 @@ a = Analysis(
         'scipy._lib.array_api_compat.torch',
         'sklearn.externals.array_api_compat.torch',
         'astropy.visualization.wcsaxes',
+        # Exclude other heavy dependencies we don't need
+        'pandas',
+        'IPython',
+        'jupyter',
+        'notebook',
+        'plotly',
+        'bokeh',
+        'seaborn',
+        'sympy',
+        'PIL.ImageQt',
+        'PyQt5',
+        'PyQt6',
+        'PySide2',
+        'PySide6',
+        'tkinter.test',
+        # Exclude test modules
+        'sklearn.tests',
+        'scipy.tests',
+        'numpy.tests',
+        'astropy.tests',
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
@@ -43,26 +79,23 @@ a = Analysis(
     noarchive=False,
 )
 
-# Only collect essential sklearn modules to avoid dependency issues
+# Let the hooks handle most of the scipy/sklearn collection
+# Only add specific modules that might still be missed
 try:
-    from PyInstaller.utils.hooks import collect_submodules
-    # Only get the specific sklearn modules we need
-    sklearn_modules = [
-        'sklearn.linear_model',
-        'sklearn.preprocessing', 
-        'sklearn.metrics',
-        'sklearn.utils',
-        'sklearn.base'
+    print("Adding additional hidden imports...")
+    additional_imports = [
+        # Core scipy modules that are sometimes missed
+        'scipy._cyutility',
+        'scipy.linalg.cython_blas',
+        'scipy.linalg.cython_lapack',
+        # Core sklearn modules
+        'sklearn.utils._typedefs',
+        'sklearn.metrics._dist_metrics',
     ]
-    for module in sklearn_modules:
-        try:
-            submodules = collect_submodules(module)
-            a.hiddenimports.extend(submodules)
-            print(f"Collected {module}")
-        except Exception as e:
-            print(f"Warning: Could not collect {module}: {e}")
+    a.hiddenimports.extend(additional_imports)
+    print("Successfully added additional hidden imports")
 except Exception as e:
-    print(f"Warning: Could not collect sklearn modules: {e}")
+    print(f"Warning: Could not add additional imports: {e}")
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
