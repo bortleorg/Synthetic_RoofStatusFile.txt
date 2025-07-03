@@ -21,6 +21,17 @@ try:
 except ImportError:
     FITS_AVAILABLE = False
 
+# ASCOM Alpaca dependencies
+try:
+    from flask import Flask
+    from flask_cors import CORS
+    FLASK_AVAILABLE = True
+except ImportError:
+    FLASK_AVAILABLE = False
+
+if FLASK_AVAILABLE:
+    from ascom_alpaca_safety import AscomAlpacaSafetyMonitor
+
 IMG_SIZE = 32
 SETTINGS_FILE = "roof_classifier_settings.json"
 
@@ -50,9 +61,15 @@ class RoofClassifierApp:
         self.secondary_source_path = tk.StringVar()
         self.twilight_preset_var = tk.StringVar(value="Custom")
         
+        # ASCOM Alpaca configuration
+        self.ascom_enabled = tk.BooleanVar(value=False)
+        self.ascom_port = tk.StringVar(value="11111")
+        self.ascom_device_number = tk.StringVar(value="0")
+        
         self.model = None
         self.stop_monitor = False
         self.logger = None
+        self.ascom_server = None
         self.load_settings()
         self.setup_logging()
         self.setup_gui()
@@ -76,6 +93,11 @@ class RoofClassifierApp:
                     self.secondary_source_enabled.set(settings.get('secondary_source_enabled', False))
                     self.secondary_source_path.set(settings.get('secondary_source_path', ''))
                     self.twilight_preset_var.set(settings.get('twilight_preset', 'Custom'))
+                    
+                    # ASCOM Alpaca settings
+                    self.ascom_enabled.set(settings.get('ascom_enabled', False))
+                    self.ascom_port.set(settings.get('ascom_port', '11111'))
+                    self.ascom_device_number.set(settings.get('ascom_device_number', '0'))
         except Exception as e:
             print(f"Error loading settings: {e}")
 
@@ -93,7 +115,10 @@ class RoofClassifierApp:
                 'sun_angle_threshold': self.sun_angle_threshold.get(),
                 'secondary_source_enabled': self.secondary_source_enabled.get(),
                 'secondary_source_path': self.secondary_source_path.get(),
-                'twilight_preset': self.twilight_preset_var.get()
+                'twilight_preset': self.twilight_preset_var.get(),
+                'ascom_enabled': self.ascom_enabled.get(),
+                'ascom_port': self.ascom_port.get(),
+                'ascom_device_number': self.ascom_device_number.get()
             }
             with open(SETTINGS_FILE, 'w') as f:
                 json.dump(settings, f, indent=2)
@@ -126,6 +151,122 @@ class RoofClassifierApp:
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(formatter)
         self.logger.addHandler(console_handler)
+
+    def start_ascom_server(self):
+        """Start the ASCOM Alpaca server"""
+        if not FLASK_AVAILABLE:
+            messagebox.showerror("Error", "Flask is not installed. Please install flask and flask-cors to use ASCOM Alpaca functionality.")
+            return
+            
+        if self.ascom_server:
+            messagebox.showwarning("Warning", "ASCOM server is already running.")
+            return
+            
+        try:
+            port = int(self.ascom_port.get())
+            device_number = int(self.ascom_device_number.get())
+            
+            self.ascom_server = AscomAlpacaSafetyMonitor(
+                port=port,
+                device_number=device_number,
+                roof_classifier_app=self
+            )
+            
+            # Start server in a separate thread
+            server_thread = threading.Thread(
+                target=self.ascom_server.run,
+                daemon=True
+            )
+            server_thread.start()
+            
+            if self.logger:
+                self.logger.info(f"ASCOM Alpaca server started on port {port}")
+            
+            messagebox.showinfo("ASCOM Server Started", 
+                f"ASCOM Alpaca Safety Monitor started on port {port}\n"
+                f"Device number: {device_number}\n"
+                f"Management API: http://localhost:{port}/management/apiversions\n"
+                f"Configure NINA to connect to: localhost:{port}")
+                
+        except ValueError:
+            messagebox.showerror("Error", "Please enter valid numeric values for port and device number.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to start ASCOM server: {str(e)}")
+            
+    def stop_ascom_server(self):
+        """Stop the ASCOM Alpaca server"""
+        if self.ascom_server:
+            try:
+                self.ascom_server.stop()
+                self.ascom_server = None
+                if self.logger:
+                    self.logger.info("ASCOM Alpaca server stopped")
+                messagebox.showinfo("ASCOM Server Stopped", "ASCOM Alpaca server has been stopped.")
+            except Exception as e:
+                messagebox.showerror("Error", f"Error stopping ASCOM server: {str(e)}")
+        else:
+            messagebox.showwarning("Warning", "ASCOM server is not running.")
+            
+    def on_ascom_enabled_changed(self):
+        """Called when ASCOM enabled checkbox is toggled"""
+        if self.ascom_enabled.get():
+            self.start_ascom_server()
+        else:
+            self.stop_ascom_server()
+        self.save_settings()
+        
+    def test_ascom_discovery(self):
+        """Test ASCOM discovery functionality"""
+        try:
+            import socket
+            import json
+            
+            # Send discovery packet
+            discovery_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            discovery_socket.settimeout(3.0)  # 3 second timeout
+            
+            # ASCOM discovery packet
+            discovery_packet = b"alpacadiscovery1"
+            discovery_socket.sendto(discovery_packet, ('127.0.0.1', 32227))
+            
+            try:
+                # Wait for response
+                data, addr = discovery_socket.recvfrom(1024)
+                response = json.loads(data.decode('utf-8'))
+                
+                messagebox.showinfo("Discovery Test Success", 
+                    f"Discovery response received from {addr}:\n\n"
+                    f"Server: {response.get('ServerName', 'Unknown')}\n"
+                    f"Port: {response.get('AlpacaPort', 'Unknown')}\n"
+                    f"Manufacturer: {response.get('Manufacturer', 'Unknown')}\n"
+                    f"Version: {response.get('ManufacturerVersion', 'Unknown')}")
+                    
+            except socket.timeout:
+                messagebox.showwarning("Discovery Test Failed", 
+                    "No discovery response received within 3 seconds.\n\n"
+                    "Possible issues:\n"
+                    "• ASCOM server not running\n"
+                    "• Firewall blocking UDP port 32227\n"
+                    "• Discovery not enabled")
+                    
+            finally:
+                discovery_socket.close()
+                
+        except ImportError:
+            messagebox.showerror("Error", "Socket module not available for discovery test.")
+        except Exception as e:
+            messagebox.showerror("Discovery Test Error", f"Error testing discovery: {str(e)}")
+            
+    def open_ascom_setup_page(self):
+        """Open the ASCOM setup page in the default web browser"""
+        try:
+            import webbrowser
+            port = self.ascom_port.get()
+            url = f"http://localhost:{port}/setup"
+            webbrowser.open(url)
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not open setup page: {str(e)}\n\n"
+                                f"Try manually opening: http://localhost:{self.ascom_port.get()}/setup")
 
     def calculate_sun_angle(self):
         """Calculate the sun's elevation angle for the given location using UTC"""
@@ -349,6 +490,68 @@ class RoofClassifierApp:
         secondary_path_frame.pack(side=tk.RIGHT, fill="x", expand=True, padx=(10,0))
         tk.Entry(secondary_path_frame, textvariable=self.secondary_source_path, width=30).pack(side=tk.LEFT, fill="x", expand=True)
         tk.Button(secondary_path_frame, text="Browse...", command=self.browse_secondary_source).pack(side=tk.RIGHT, padx=(5,0))
+
+        # ASCOM Alpaca configuration section
+        if FLASK_AVAILABLE:
+            ascom_frame = tk.LabelFrame(self.root, text="ASCOM Alpaca Safety Monitor", padx=5, pady=5)
+            ascom_frame.pack(fill="x", padx=10, pady=5)
+            
+            # Enable ASCOM checkbox
+            ascom_enable_frame = tk.Frame(ascom_frame)
+            ascom_enable_frame.pack(fill="x", pady=2)
+            
+            ascom_checkbox = tk.Checkbutton(ascom_enable_frame, text="Enable ASCOM Alpaca Safety Monitor", 
+                                          variable=self.ascom_enabled, command=self.on_ascom_enabled_changed)
+            ascom_checkbox.pack(side=tk.LEFT)
+            
+            # Port and device number configuration
+            ascom_config_frame = tk.Frame(ascom_frame)
+            ascom_config_frame.pack(fill="x", pady=2)
+            
+            tk.Label(ascom_config_frame, text="Port:").pack(side=tk.LEFT)
+            tk.Entry(ascom_config_frame, textvariable=self.ascom_port, width=6).pack(side=tk.LEFT, padx=(2,10))
+            
+            tk.Label(ascom_config_frame, text="Device Number:").pack(side=tk.LEFT)
+            tk.Entry(ascom_config_frame, textvariable=self.ascom_device_number, width=6).pack(side=tk.LEFT, padx=(2,10))
+            
+            # Manual control buttons
+            ascom_buttons_frame = tk.Frame(ascom_frame)
+            ascom_buttons_frame.pack(fill="x", pady=2)
+            
+            tk.Button(ascom_buttons_frame, text="Start ASCOM Server", 
+                     command=self.start_ascom_server).pack(side=tk.LEFT, padx=5)
+            tk.Button(ascom_buttons_frame, text="Stop ASCOM Server", 
+                     command=self.stop_ascom_server).pack(side=tk.LEFT, padx=5)
+            tk.Button(ascom_buttons_frame, text="Test Discovery", 
+                     command=self.test_ascom_discovery).pack(side=tk.LEFT, padx=5)
+            tk.Button(ascom_buttons_frame, text="Open Setup Page", 
+                     command=self.open_ascom_setup_page).pack(side=tk.LEFT, padx=5)
+            
+            # Information
+            ascom_info_frame = tk.Frame(ascom_frame)
+            ascom_info_frame.pack(fill="x", pady=2)
+            
+            info_text = ("Configure NINA to connect to this Safety Monitor:\n"
+                        "• NINA will auto-discover this device (recommended)\n"
+                        "• Or manually configure:\n"
+                        "  - Device Type: Safety Monitor (Alpaca)\n"
+                        "  - IP Address: localhost or your computer's IP\n"
+                        "  - Port: (as configured above)\n"
+                        "  - Device Number: (as configured above)\n"
+                        "• Discovery runs on UDP port 32227\n"
+                        "• Use 'Test Discovery' to verify network setup")
+            
+            tk.Label(ascom_info_frame, text=info_text, font=("Arial", 8), 
+                    fg="darkgreen", justify=tk.LEFT).pack(anchor="w")
+        else:
+            # Show message if Flask is not available
+            flask_frame = tk.LabelFrame(self.root, text="ASCOM Alpaca Safety Monitor", padx=5, pady=5)
+            flask_frame.pack(fill="x", padx=10, pady=5)
+            
+            tk.Label(flask_frame, 
+                    text="ASCOM Alpaca functionality requires Flask and Flask-CORS.\n"
+                         "Run: pip install flask flask-cors",
+                    fg="red", justify=tk.LEFT).pack(anchor="w")
 
         # Utilities section
         utils_frame = tk.LabelFrame(self.root, text="Utilities", padx=5, pady=5)

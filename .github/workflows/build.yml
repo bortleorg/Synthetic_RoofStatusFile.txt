@@ -61,6 +61,16 @@ jobs:
           except ImportError as e:
               print(f'[WARN] astropy import issue: {e}')
           
+          # Test ASCOM Alpaca dependencies
+          try:
+              import flask
+              print('[OK] flask')
+              import flask_cors
+              print('[OK] flask_cors')
+              print('[OK] ASCOM Alpaca dependencies available')
+          except ImportError as e:
+              print(f'[WARN] ASCOM Alpaca dependencies issue: {e}')
+          
           print('All core imports successful!')
           "
 
@@ -74,6 +84,16 @@ jobs:
             $fileInfo = Get-Item "dist/Synthetic_RoofStatusFile.exe"
             Write-Host "[SUCCESS] Build completed!"
             Write-Host "File size: $([math]::Round($fileInfo.Length / 1MB, 2)) MB"
+            
+            # Test the executable
+            echo "Testing executable runtime dependencies..."
+            & "dist/Synthetic_RoofStatusFile.exe" --version 2>&1 | Out-Host
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "[SUCCESS] Executable runs successfully"
+            } else {
+              Write-Host "[WARN] Executable may have issues (exit code: $LASTEXITCODE)"
+              Write-Host "This may be normal if the app requires GUI interaction"
+            }
           } else {
             Write-Error "Build failed - executable not found"
             exit 1

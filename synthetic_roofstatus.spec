@@ -25,6 +25,18 @@ a = Analysis(
         'tkinter.filedialog',
         'tkinter.messagebox',
         'tkinter.ttk',
+        # Flask dependencies for ASCOM Alpaca
+        'flask',
+        'flask.helpers',
+        'flask.json',
+        'flask.logging',
+        'flask_cors',
+        'werkzeug',
+        'werkzeug.serving',
+        'werkzeug.utils',
+        'jinja2',
+        'itsdangerous',
+        'click',
         # Scipy compiled extensions that are often missed
         'scipy._lib._ccallback_c',
         'scipy._cyutility',
