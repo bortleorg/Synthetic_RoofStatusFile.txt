@@ -570,7 +570,7 @@ class RoofClassifierApp:
         hashes = set()
         if os.path.isdir(label):
             for file in os.listdir(label):
-                if file.lower().endswith(".png"):
+                if file.lower().endswith((".png", ".jpg", ".jpeg")):
                     try:
                         hash_val = self.get_image_hash(os.path.join(label, file))
                         hashes.add(hash_val)
@@ -579,7 +579,7 @@ class RoofClassifierApp:
         return hashes
 
     def add_frame(self, label):
-        files = filedialog.askopenfilenames(filetypes=[("PNG files", "*.png")])
+        files = filedialog.askopenfilenames(filetypes=[("Image files", "*.png *.jpg *.jpeg"), ("All files", "*.*")])
         if not files:
             return
         os.makedirs(label, exist_ok=True)
@@ -622,9 +622,9 @@ class RoofClassifierApp:
         closed_count = 0
         
         if os.path.isdir("open"):
-            open_count = len([f for f in os.listdir("open") if f.lower().endswith(".png")])
+            open_count = len([f for f in os.listdir("open") if f.lower().endswith((".png", ".jpg", ".jpeg"))])
         if os.path.isdir("closed"):
-            closed_count = len([f for f in os.listdir("closed") if f.lower().endswith(".png")])
+            closed_count = len([f for f in os.listdir("closed") if f.lower().endswith((".png", ".jpg", ".jpeg"))])
             
         self.stats_label.config(text=f"Training set: Open: {open_count}, Closed: {closed_count}")
 
@@ -647,7 +647,7 @@ class RoofClassifierApp:
             if not os.path.isdir(label):
                 continue
             for file in os.listdir(label):
-                if file.lower().endswith(".png"):
+                if file.lower().endswith((".png", ".jpg", ".jpeg")):
                     img = self.prep_image(os.path.join(label, file))
                     X.append(img.flatten())
                     y.append(val)
@@ -723,7 +723,7 @@ class RoofClassifierApp:
             if not os.path.isdir(val_folder):
                 continue
             for file in os.listdir(val_folder):
-                if file.lower().endswith(".png"):
+                if file.lower().endswith((".png", ".jpg", ".jpeg")):
                     try:
                         img = self.prep_image(os.path.join(val_folder, file))
                         X_val.append(img.flatten())
@@ -794,13 +794,13 @@ class RoofClassifierApp:
                 self.logger.error("No model loaded or invalid monitor folder")
             return None, "No model or invalid folder"
         
-        pngs = [f for f in os.listdir(folder) if f.lower().endswith(".png")]
-        if not pngs:
+        images = [f for f in os.listdir(folder) if f.lower().endswith((".png", ".jpg", ".jpeg"))]
+        if not images:
             if self.logger:
-                self.logger.warning("No PNG files found in monitor folder")
-            return None, "No PNG files found"
+                self.logger.warning("No image files found in monitor folder")
+            return None, "No image files found"
         
-        latest = max(pngs, key=lambda f: os.path.getmtime(os.path.join(folder, f)))
+        latest = max(images, key=lambda f: os.path.getmtime(os.path.join(folder, f)))
         img_path = os.path.join(folder, latest)
         
         # Get secondary source status for comparison
