@@ -373,8 +373,16 @@ class RoofClassifierApp:
             return None, None
 
     def setup_gui(self):
+        # Top-level notebook for tabbed layout
+        notebook = ttk.Notebook(self.root)
+        notebook.pack(fill="both", expand=True, padx=5, pady=5)
+
+        # ── Tab 1: Training & Model ───────────────────────────────────────────
+        tab_train = ttk.Frame(notebook)
+        notebook.add(tab_train, text="Training & Model")
+
         # Training section
-        train_frame = tk.LabelFrame(self.root, text="Training Data", padx=5, pady=5)
+        train_frame = tk.LabelFrame(tab_train, text="Training Data", padx=5, pady=5)
         train_frame.pack(fill="x", padx=10, pady=5)
 
         # Training data folder row
@@ -407,7 +415,7 @@ class RoofClassifierApp:
         self.update_training_stats()
 
         # Model section
-        model_frame = tk.LabelFrame(self.root, text="Model", padx=5, pady=5)
+        model_frame = tk.LabelFrame(tab_train, text="Model", padx=5, pady=5)
         model_frame.pack(fill="x", padx=10, pady=5)
 
         model_btn_frame = tk.Frame(model_frame)
@@ -436,10 +444,13 @@ class RoofClassifierApp:
         tk.Entry(val_set_entry_frame, textvariable=self.validation_set_path, width=40).pack(side=tk.LEFT, fill="x", expand=True)
         tk.Button(val_set_entry_frame, text="Browse...", command=self.browse_validation_set).pack(side=tk.RIGHT, padx=(5, 0))
 
-        # Monitoring section
-        monitor_frame = tk.LabelFrame(self.root, text="Monitoring", padx=5, pady=5)
+        # ── Tab 2: Monitoring ─────────────────────────────────────────────────
+        tab_monitor = ttk.Frame(notebook)
+        notebook.add(tab_monitor, text="Monitoring")
+
+        monitor_frame = tk.LabelFrame(tab_monitor, text="Monitoring", padx=5, pady=5)
         monitor_frame.pack(fill="x", padx=10, pady=5)
-        
+
         # Monitor folder with browse button
         monitor_folder_frame = tk.Frame(monitor_frame)
         monitor_folder_frame.pack(fill="x", pady=2)
@@ -448,7 +459,7 @@ class RoofClassifierApp:
         folder_entry_frame.pack(fill="x")
         tk.Entry(folder_entry_frame, textvariable=self.monitor_path, width=40).pack(side=tk.LEFT, fill="x", expand=True)
         tk.Button(folder_entry_frame, text="Browse...", command=self.browse_monitor_folder).pack(side=tk.RIGHT, padx=(5,0))
-        
+
         # Output file with browse button
         output_file_frame = tk.Frame(monitor_frame)
         output_file_frame.pack(fill="x", pady=2)
@@ -457,7 +468,7 @@ class RoofClassifierApp:
         output_entry_frame.pack(fill="x")
         tk.Entry(output_entry_frame, textvariable=self.output_path, width=40).pack(side=tk.LEFT, fill="x", expand=True)
         tk.Button(output_entry_frame, text="Browse...", command=self.browse_output_file).pack(side=tk.RIGHT, padx=(5,0))
-        
+
         button_frame = tk.Frame(monitor_frame)
         button_frame.pack(pady=5)
         tk.Button(button_frame, text="Start Monitoring", command=self.start_monitoring).pack(side=tk.LEFT, padx=5)
@@ -471,23 +482,26 @@ class RoofClassifierApp:
         self.countdown_label = tk.Label(status_frame, text="", fg="blue")
         self.countdown_label.pack()
 
-        # Configuration section
-        config_frame = tk.LabelFrame(self.root, text="Configuration", padx=5, pady=5)
+        # ── Tab 3: Configuration ──────────────────────────────────────────────
+        tab_config = ttk.Frame(notebook)
+        notebook.add(tab_config, text="Configuration")
+
+        config_frame = tk.LabelFrame(tab_config, text="Configuration", padx=5, pady=5)
         config_frame.pack(fill="x", padx=10, pady=5)
-        
+
         # Logging configuration
         log_frame = tk.Frame(config_frame)
         log_frame.pack(fill="x", pady=2)
-        
-        log_checkbox = tk.Checkbutton(log_frame, text="Enable Logging to File", 
+
+        log_checkbox = tk.Checkbutton(log_frame, text="Enable Logging to File",
                                      variable=self.log_enabled, command=self.on_log_enabled_changed)
         log_checkbox.pack(side=tk.LEFT)
-        
+
         log_path_frame = tk.Frame(log_frame)
         log_path_frame.pack(side=tk.RIGHT, fill="x", expand=True, padx=(10,0))
         tk.Entry(log_path_frame, textvariable=self.log_path, width=30).pack(side=tk.LEFT, fill="x", expand=True)
         tk.Button(log_path_frame, text="Browse...", command=self.browse_log_file).pack(side=tk.RIGHT, padx=(5,0))
-        
+
         # Observatory location
         location_frame = tk.Frame(config_frame)
         location_frame.pack(fill="x", pady=2)
@@ -496,50 +510,49 @@ class RoofClassifierApp:
         tk.Entry(location_frame, textvariable=self.latitude, width=8).pack(side=tk.LEFT, padx=(2,5))
         tk.Label(location_frame, text="Lon:").pack(side=tk.LEFT)
         tk.Entry(location_frame, textvariable=self.longitude, width=8).pack(side=tk.LEFT, padx=(2,5))
-        
+
         # Twilight threshold configuration
         twilight_frame = tk.Frame(config_frame)
         twilight_frame.pack(fill="x", pady=2)
         tk.Label(twilight_frame, text="Sun Angle Threshold:").pack(side=tk.LEFT)
-        
+
         # Manual threshold entry
         tk.Entry(twilight_frame, textvariable=self.sun_angle_threshold, width=6).pack(side=tk.LEFT, padx=(2,0))
         tk.Label(twilight_frame, text="°").pack(side=tk.LEFT)
-        
+
         # Twilight presets
         preset_frame = tk.Frame(config_frame)
         preset_frame.pack(fill="x", pady=2)
         tk.Label(preset_frame, text="Presets:").pack(side=tk.LEFT)
         for preset_name in TWILIGHT_PRESETS.keys():
-            tk.Button(preset_frame, text=preset_name, 
+            tk.Button(preset_frame, text=preset_name,
                      command=lambda p=preset_name: self.apply_twilight_preset(p)).pack(side=tk.LEFT, padx=2)
-        
 
         # Observation window display
         window_frame = tk.Frame(config_frame)
         window_frame.pack(fill="x", pady=5)
-        self.obs_window_label = tk.Label(window_frame, text="Calculating observation window...", 
+        self.obs_window_label = tk.Label(window_frame, text="Calculating observation window...",
                                    fg="darkgreen", justify=tk.LEFT, font=("Arial", 9))
         self.obs_window_label.pack(side=tk.LEFT)
         tk.Button(window_frame, text="Refresh", command=self.update_observation_window_display).pack(side=tk.RIGHT)
-        
+
         # UTC time note
         utc_note_frame = tk.Frame(config_frame)
         utc_note_frame.pack(fill="x", pady=2)
-        tk.Label(utc_note_frame, text="All times UTC", 
+        tk.Label(utc_note_frame, text="All times UTC",
                 fg="gray", font=("Arial", 8)).pack(anchor="w")
-        
+
         # Update window display after GUI is set up
         self.root.after(1000, self.update_observation_window_display)
 
         # Secondary source
         secondary_frame = tk.Frame(config_frame)
         secondary_frame.pack(fill="x", pady=2)
-        
-        secondary_checkbox = tk.Checkbutton(secondary_frame, text="Monitor Secondary Roof Status File", 
+
+        secondary_checkbox = tk.Checkbutton(secondary_frame, text="Monitor Secondary Roof Status File",
                                           variable=self.secondary_source_enabled)
         secondary_checkbox.pack(side=tk.LEFT)
-        
+
         secondary_path_frame = tk.Frame(secondary_frame)
         secondary_path_frame.pack(side=tk.RIGHT, fill="x", expand=True, padx=(10,0))
         tk.Entry(secondary_path_frame, textvariable=self.secondary_source_path, width=30).pack(side=tk.LEFT, fill="x", expand=True)
@@ -547,44 +560,44 @@ class RoofClassifierApp:
 
         # ASCOM Alpaca configuration section
         if FLASK_AVAILABLE:
-            ascom_frame = tk.LabelFrame(self.root, text="ASCOM Alpaca Safety Monitor", padx=5, pady=5)
+            ascom_frame = tk.LabelFrame(tab_config, text="ASCOM Alpaca Safety Monitor", padx=5, pady=5)
             ascom_frame.pack(fill="x", padx=10, pady=5)
-            
+
             # Enable ASCOM checkbox
             ascom_enable_frame = tk.Frame(ascom_frame)
             ascom_enable_frame.pack(fill="x", pady=2)
-            
-            ascom_checkbox = tk.Checkbutton(ascom_enable_frame, text="Enable ASCOM Alpaca Safety Monitor", 
+
+            ascom_checkbox = tk.Checkbutton(ascom_enable_frame, text="Enable ASCOM Alpaca Safety Monitor",
                                           variable=self.ascom_enabled, command=self.on_ascom_enabled_changed)
             ascom_checkbox.pack(side=tk.LEFT)
-            
+
             # Port and device number configuration
             ascom_config_frame = tk.Frame(ascom_frame)
             ascom_config_frame.pack(fill="x", pady=2)
-            
+
             tk.Label(ascom_config_frame, text="Port:").pack(side=tk.LEFT)
             tk.Entry(ascom_config_frame, textvariable=self.ascom_port, width=6).pack(side=tk.LEFT, padx=(2,10))
-            
+
             tk.Label(ascom_config_frame, text="Device Number:").pack(side=tk.LEFT)
             tk.Entry(ascom_config_frame, textvariable=self.ascom_device_number, width=6).pack(side=tk.LEFT, padx=(2,10))
-            
+
             # Manual control buttons
             ascom_buttons_frame = tk.Frame(ascom_frame)
             ascom_buttons_frame.pack(fill="x", pady=2)
-            
-            tk.Button(ascom_buttons_frame, text="Start ASCOM Server", 
+
+            tk.Button(ascom_buttons_frame, text="Start ASCOM Server",
                      command=self.start_ascom_server).pack(side=tk.LEFT, padx=5)
-            tk.Button(ascom_buttons_frame, text="Stop ASCOM Server", 
+            tk.Button(ascom_buttons_frame, text="Stop ASCOM Server",
                      command=self.stop_ascom_server).pack(side=tk.LEFT, padx=5)
-            tk.Button(ascom_buttons_frame, text="Test Discovery", 
+            tk.Button(ascom_buttons_frame, text="Test Discovery",
                      command=self.test_ascom_discovery).pack(side=tk.LEFT, padx=5)
-            tk.Button(ascom_buttons_frame, text="Open Setup Page", 
+            tk.Button(ascom_buttons_frame, text="Open Setup Page",
                      command=self.open_ascom_setup_page).pack(side=tk.LEFT, padx=5)
-            
+
             # Information
             ascom_info_frame = tk.Frame(ascom_frame)
             ascom_info_frame.pack(fill="x", pady=2)
-            
+
             info_text = ("Configure NINA to connect to this Safety Monitor:\n"
                         "• NINA will auto-discover this device (recommended)\n"
                         "• Or manually configure:\n"
@@ -594,23 +607,26 @@ class RoofClassifierApp:
                         "  - Device Number: (as configured above)\n"
                         "• Discovery runs on UDP port 32227\n"
                         "• Use 'Test Discovery' to verify network setup")
-            
-            tk.Label(ascom_info_frame, text=info_text, font=("Arial", 8), 
+
+            tk.Label(ascom_info_frame, text=info_text, font=("Arial", 8),
                     fg="darkgreen", justify=tk.LEFT).pack(anchor="w")
         else:
             # Show message if Flask is not available
-            flask_frame = tk.LabelFrame(self.root, text="ASCOM Alpaca Safety Monitor", padx=5, pady=5)
+            flask_frame = tk.LabelFrame(tab_config, text="ASCOM Alpaca Safety Monitor", padx=5, pady=5)
             flask_frame.pack(fill="x", padx=10, pady=5)
-            
-            tk.Label(flask_frame, 
+
+            tk.Label(flask_frame,
                     text="ASCOM Alpaca functionality requires Flask and Flask-CORS.\n"
                          "Run: pip install flask flask-cors",
                     fg="red", justify=tk.LEFT).pack(anchor="w")
 
-        # Utilities section
-        utils_frame = tk.LabelFrame(self.root, text="Utilities", padx=5, pady=5)
+        # ── Tab 4: Utilities ──────────────────────────────────────────────────
+        tab_utils = ttk.Frame(notebook)
+        notebook.add(tab_utils, text="Utilities")
+
+        utils_frame = tk.LabelFrame(tab_utils, text="Utilities", padx=5, pady=5)
         utils_frame.pack(fill="x", padx=10, pady=5)
-        
+
         tk.Button(utils_frame, text="Convert FITS to PNG", command=self.convert_fits_to_png).pack(side=tk.LEFT, padx=5)
 
     def _get_training_class_folder(self, label):
