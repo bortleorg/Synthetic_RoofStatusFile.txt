@@ -13,6 +13,8 @@ import hashlib
 import json
 import logging
 import shutil
+import random
+import tempfile
 import ephem
 import pytz
 try:
@@ -34,6 +36,12 @@ if FLASK_AVAILABLE:
 
 IMG_SIZE = 32
 SETTINGS_FILE = "roof_classifier_settings.json"
+
+# Image display size constants
+_PREVIEW_IMG_MAX_W = 800   # max width when previewing the latest monitor image
+_PREVIEW_IMG_MAX_H = 600   # max height when previewing the latest monitor image
+_CLASSIFY_IMG_MAX_W = 820  # max width in the classify-images window (leaves room for button bar)
+_CLASSIFY_IMG_MAX_H = 460  # max height in the classify-images window
 
 # Twilight angle presets (standard astronomical definitions)
 TWILIGHT_PRESETS = {
@@ -66,6 +74,11 @@ class RoofClassifierApp:
         self.ascom_port = tk.StringVar(value="11111")
         self.ascom_device_number = tk.StringVar(value="0")
         
+        # Training set management configuration
+        self.training_data_folder = tk.StringVar(value="")
+        self.sample_mode_enabled = tk.BooleanVar(value=False)
+        self.sample_rate = tk.StringVar(value="0.1")
+
         self.model = None
         self.stop_monitor = False
         self.logger = None
@@ -98,6 +111,11 @@ class RoofClassifierApp:
                     self.ascom_enabled.set(settings.get('ascom_enabled', False))
                     self.ascom_port.set(settings.get('ascom_port', '11111'))
                     self.ascom_device_number.set(settings.get('ascom_device_number', '0'))
+
+                    # Training set management settings
+                    self.training_data_folder.set(settings.get('training_data_folder', ''))
+                    self.sample_mode_enabled.set(settings.get('sample_mode_enabled', False))
+                    self.sample_rate.set(settings.get('sample_rate', '0.1'))
         except Exception as e:
             print(f"Error loading settings: {e}")
 
@@ -118,7 +136,10 @@ class RoofClassifierApp:
                 'twilight_preset': self.twilight_preset_var.get(),
                 'ascom_enabled': self.ascom_enabled.get(),
                 'ascom_port': self.ascom_port.get(),
-                'ascom_device_number': self.ascom_device_number.get()
+                'ascom_device_number': self.ascom_device_number.get(),
+                'training_data_folder': self.training_data_folder.get(),
+                'sample_mode_enabled': self.sample_mode_enabled.get(),
+                'sample_rate': self.sample_rate.get()
             }
             with open(SETTINGS_FILE, 'w') as f:
                 json.dump(settings, f, indent=2)
@@ -354,11 +375,32 @@ class RoofClassifierApp:
         # Training section
         train_frame = tk.LabelFrame(self.root, text="Training Data", padx=5, pady=5)
         train_frame.pack(fill="x", padx=10, pady=5)
-        
-        tk.Button(train_frame, text="Add Frame (Open)", command=lambda: self.add_frame("open")).pack(side=tk.LEFT, padx=5)
-        tk.Button(train_frame, text="Add Frame (Closed)", command=lambda: self.add_frame("closed")).pack(side=tk.LEFT, padx=5)
-        tk.Button(train_frame, text="Clear Training Data", command=self.clear_training_data).pack(side=tk.LEFT, padx=5)
-        
+
+        # Training data folder row
+        td_folder_frame = tk.Frame(train_frame)
+        td_folder_frame.pack(fill="x", pady=2)
+        tk.Label(td_folder_frame, text="Training Data Folder:").pack(anchor="w")
+        td_folder_entry_frame = tk.Frame(td_folder_frame)
+        td_folder_entry_frame.pack(fill="x")
+        tk.Entry(td_folder_entry_frame, textvariable=self.training_data_folder, width=40).pack(side=tk.LEFT, fill="x", expand=True)
+        tk.Button(td_folder_entry_frame, text="Browse...", command=self.browse_training_data_folder).pack(side=tk.RIGHT, padx=(5, 0))
+
+        # Action buttons row
+        action_frame = tk.Frame(train_frame)
+        action_frame.pack(fill="x", pady=2)
+        tk.Button(action_frame, text="Add Frame (Open)", command=lambda: self.add_frame("open")).pack(side=tk.LEFT, padx=5)
+        tk.Button(action_frame, text="Add Frame (Closed)", command=lambda: self.add_frame("closed")).pack(side=tk.LEFT, padx=5)
+        tk.Button(action_frame, text="Clear Training Data", command=self.clear_training_data).pack(side=tk.LEFT, padx=5)
+        tk.Button(action_frame, text="Preview Latest Image", command=self.preview_latest_image).pack(side=tk.LEFT, padx=5)
+        tk.Button(action_frame, text="Classify Unclassified Images", command=self.open_classify_images_window).pack(side=tk.LEFT, padx=5)
+
+        # Random sampling mode row
+        sample_frame = tk.Frame(train_frame)
+        sample_frame.pack(fill="x", pady=2)
+        tk.Checkbutton(sample_frame, text="Save random samples for classification  Rate (0–1):",
+                       variable=self.sample_mode_enabled, command=self.save_settings).pack(side=tk.LEFT)
+        tk.Entry(sample_frame, textvariable=self.sample_rate, width=5).pack(side=tk.LEFT, padx=(2, 0))
+
         # Stats display
         self.stats_label = tk.Label(train_frame, text="Training set: Open: 0, Closed: 0", fg="blue")
         self.stats_label.pack(pady=5)
@@ -559,20 +601,31 @@ class RoofClassifierApp:
         
         tk.Button(utils_frame, text="Convert FITS to PNG", command=self.convert_fits_to_png).pack(side=tk.LEFT, padx=5)
 
+    def _get_training_class_folder(self, label):
+        """Return the full path to a training class subfolder (open/closed/unclassified/other).
+
+        If a training_data_folder has been configured it is used as the base; otherwise the
+        folder name is returned as-is for backward-compatible relative-path behaviour.
+        """
+        base = self.training_data_folder.get().strip()
+        if base:
+            return os.path.join(base, label)
+        return label
+
     def get_image_hash(self, image_path):
         """Generate a hash of the image content to detect duplicates"""
         img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
         img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
         return hashlib.md5(img.tobytes()).hexdigest()
 
-    def get_existing_hashes(self, label):
-        """Get hashes of all existing images in the training folder"""
+    def get_existing_hashes(self, folder_path):
+        """Get hashes of all existing images in the given training folder"""
         hashes = set()
-        if os.path.isdir(label):
-            for file in os.listdir(label):
+        if os.path.isdir(folder_path):
+            for file in os.listdir(folder_path):
                 if file.lower().endswith((".png", ".jpg", ".jpeg")):
                     try:
-                        hash_val = self.get_image_hash(os.path.join(label, file))
+                        hash_val = self.get_image_hash(os.path.join(folder_path, file))
                         hashes.add(hash_val)
                     except:
                         continue
@@ -582,12 +635,13 @@ class RoofClassifierApp:
         files = filedialog.askopenfilenames(filetypes=[("Image files", "*.png *.jpg *.jpeg"), ("All files", "*.*")])
         if not files:
             return
-        os.makedirs(label, exist_ok=True)
-        
-        existing_hashes = self.get_existing_hashes(label)
+        folder = self._get_training_class_folder(label)
+        os.makedirs(folder, exist_ok=True)
+
+        existing_hashes = self.get_existing_hashes(folder)
         count = 0
         duplicates = 0
-        
+
         for path in files:
             # Check if this image is already in the training set
             try:
@@ -595,8 +649,8 @@ class RoofClassifierApp:
                 if img_hash in existing_hashes:
                     duplicates += 1
                     continue
-                    
-                dest = os.path.join(label, os.path.basename(path))
+
+                dest = os.path.join(folder, os.path.basename(path))
                 # If file exists, add a number suffix
                 base, ext = os.path.splitext(dest)
                 counter = 1
@@ -609,7 +663,7 @@ class RoofClassifierApp:
                 count += 1
             except Exception as e:
                 print(f"Error processing {path}: {e}")
-                
+
         message = f"{count} {label} frame(s) saved."
         if duplicates > 0:
             message += f" {duplicates} duplicate(s) skipped."
@@ -618,24 +672,29 @@ class RoofClassifierApp:
 
     def update_training_stats(self):
         """Update the training statistics display"""
-        open_count = 0
-        closed_count = 0
-        
-        if os.path.isdir("open"):
-            open_count = len([f for f in os.listdir("open") if f.lower().endswith((".png", ".jpg", ".jpeg"))])
-        if os.path.isdir("closed"):
-            closed_count = len([f for f in os.listdir("closed") if f.lower().endswith((".png", ".jpg", ".jpeg"))])
-            
-        self.stats_label.config(text=f"Training set: Open: {open_count}, Closed: {closed_count}")
+        def _count(label):
+            folder = self._get_training_class_folder(label)
+            if os.path.isdir(folder):
+                return len([f for f in os.listdir(folder) if f.lower().endswith((".png", ".jpg", ".jpeg"))])
+            return 0
+
+        open_count = _count("open")
+        closed_count = _count("closed")
+        unclassified_count = _count("unclassified")
+
+        text = f"Training set: Open: {open_count}, Closed: {closed_count}"
+        if unclassified_count:
+            text += f", Unclassified: {unclassified_count}"
+        self.stats_label.config(text=text)
 
     def clear_training_data(self):
         """Clear all training data"""
         result = messagebox.askyesno("Confirm", "Are you sure you want to delete all training data?")
         if not result:
             return
-            
-        import shutil
-        for folder in ["open", "closed"]:
+
+        for label in ["open", "closed"]:
+            folder = self._get_training_class_folder(label)
             if os.path.isdir(folder):
                 shutil.rmtree(folder)
         messagebox.showinfo("Cleared", "All training data has been cleared.")
@@ -644,11 +703,12 @@ class RoofClassifierApp:
     def train_model(self):
         X, y = [], []
         for label, val in [("open", 1), ("closed", 0)]:
-            if not os.path.isdir(label):
+            folder = self._get_training_class_folder(label)
+            if not os.path.isdir(folder):
                 continue
-            for file in os.listdir(label):
+            for file in os.listdir(folder):
                 if file.lower().endswith((".png", ".jpg", ".jpeg")):
-                    img = self.prep_image(os.path.join(label, file))
+                    img = self.prep_image(os.path.join(folder, file))
                     X.append(img.flatten())
                     y.append(val)
         if not X:
@@ -656,12 +716,12 @@ class RoofClassifierApp:
             return
         clf = LogisticRegression(max_iter=1000)
         clf.fit(X, y)
-        
+
         # Show training summary
         open_count = sum(1 for label in y if label == 1)
         closed_count = sum(1 for label in y if label == 0)
         message = f"Model trained successfully!\nTraining samples: Open: {open_count}, Closed: {closed_count}"
-        
+
         if self.model_path.get():
             dump(clf, self.model_path.get())
             message += f"\nModel saved to {self.model_path.get()}"
@@ -802,7 +862,10 @@ class RoofClassifierApp:
         
         latest = max(images, key=lambda f: os.path.getmtime(os.path.join(folder, f)))
         img_path = os.path.join(folder, latest)
-        
+
+        # Optionally save a random sample for manual classification
+        self.save_sample_if_needed(img_path)
+
         # Get secondary source status for comparison
         secondary_status, secondary_time = self.read_secondary_source()
         
@@ -1015,6 +1078,271 @@ class RoofClassifierApp:
         if folder:
             self.monitor_path.set(folder)
             self.save_settings()
+
+    def browse_training_data_folder(self):
+        """Browse for the base training data folder"""
+        current = self.training_data_folder.get().strip()
+        initial_dir = current if current and os.path.isdir(current) else os.getcwd()
+        folder = filedialog.askdirectory(
+            title="Select Training Data Folder",
+            initialdir=initial_dir
+        )
+        if folder:
+            self.training_data_folder.set(folder)
+            self.save_settings()
+            self.update_training_stats()
+
+    def preview_latest_image(self):
+        """Preview the most recent image in the monitor folder"""
+        folder = self.monitor_path.get().strip()
+        if not folder or not os.path.isdir(folder):
+            messagebox.showerror("Error", "Please set a valid Monitor Folder first.")
+            return
+
+        images = [f for f in os.listdir(folder) if f.lower().endswith((".png", ".jpg", ".jpeg"))]
+        if not images:
+            messagebox.showinfo("No Images", "No image files found in the monitor folder.")
+            return
+
+        latest = max(images, key=lambda f: os.path.getmtime(os.path.join(folder, f)))
+        self._show_image_in_window(os.path.join(folder, latest), f"Preview: {latest}")
+
+    def _show_image_in_window(self, img_path, title="Image Preview"):
+        """Display an image file in a pop-up Toplevel window."""
+        img_cv = cv2.imread(img_path)
+        if img_cv is None:
+            messagebox.showerror("Error", f"Could not load image:\n{img_path}")
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title(title)
+
+        # Scale image to fit inside the configured preview area
+        max_w, max_h = _PREVIEW_IMG_MAX_W, _PREVIEW_IMG_MAX_H
+        h, w = img_cv.shape[:2]
+        scale = min(max_w / w, max_h / h, 1.0)
+        disp = cv2.resize(img_cv, (int(w * scale), int(h * scale)))
+
+        # Write to a temporary PNG so tk.PhotoImage can load it (no Pillow needed)
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".png")
+        os.close(tmp_fd)
+        cv2.imwrite(tmp_path, disp)
+
+        try:
+            tk_img = tk.PhotoImage(file=tmp_path)
+        except Exception as e:
+            os.unlink(tmp_path)
+            messagebox.showerror("Error", f"Could not display image: {e}")
+            win.destroy()
+            return
+
+        lbl = tk.Label(win, image=tk_img)
+        lbl.image = tk_img  # keep reference alive
+        lbl.pack()
+        tk.Label(win, text=img_path, fg="gray", font=("Arial", 8)).pack()
+
+        def _on_preview_close():
+            if os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", _on_preview_close)
+
+    def save_sample_if_needed(self, img_path):
+        """Randomly copy an image to the unclassified folder when sampling mode is active."""
+        if not self.sample_mode_enabled.get():
+            return
+        try:
+            rate = float(self.sample_rate.get())
+        except ValueError:
+            return
+        if not 0.0 <= rate <= 1.0:
+            return
+        if random.random() >= rate:
+            return
+        try:
+            unclassified_folder = self._get_training_class_folder("unclassified")
+            os.makedirs(unclassified_folder, exist_ok=True)
+            dest = os.path.join(unclassified_folder, os.path.basename(img_path))
+            base, ext = os.path.splitext(dest)
+            counter = 1
+            while os.path.exists(dest):
+                dest = f"{base}_{counter}{ext}"
+                counter += 1
+            shutil.copy2(img_path, dest)
+            if self.logger:
+                self.logger.info(f"Saved random sample to unclassified folder: {dest}")
+            # Refresh stats on the main thread
+            self.root.after(0, self.update_training_stats)
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"Error saving random sample: {e}")
+
+    def open_classify_images_window(self):
+        """Open the manual classification window for unclassified images."""
+        unclassified_folder = self._get_training_class_folder("unclassified")
+        if not os.path.isdir(unclassified_folder):
+            messagebox.showinfo(
+                "No Images",
+                "No unclassified images folder found.\n\n"
+                "Enable 'Save random samples' mode and start monitoring to collect images,\n"
+                "or add a training data folder that contains an 'unclassified' sub-folder."
+            )
+            return
+
+        images = sorted(
+            [f for f in os.listdir(unclassified_folder) if f.lower().endswith((".png", ".jpg", ".jpeg"))]
+        )
+        if not images:
+            messagebox.showinfo("No Images", "No unclassified images to classify.")
+            return
+
+        self._show_classify_window(unclassified_folder, images)
+
+    def _show_classify_window(self, unclassified_folder, images):
+        """Show a Toplevel window for classifying images one-by-one."""
+        win = tk.Toplevel(self.root)
+        win.title("Classify Unclassified Images")
+        win.geometry("860x620")
+        win.resizable(True, True)
+
+        state = {
+            "index": 0,
+            "images": list(images),
+            # history entries: (dest_path, src_path) so we can undo by moving back
+            "history": [],
+            "tk_img": None,   # keep PhotoImage alive
+            "tmp_path": None, # last temp file to clean up
+        }
+
+        # ── Image display ─────────────────────────────────────────────────────
+        img_canvas_frame = tk.Frame(win, bg="black")
+        img_canvas_frame.pack(fill="both", expand=True, padx=10, pady=(10, 0))
+
+        img_label = tk.Label(img_canvas_frame, bg="black")
+        img_label.pack(expand=True, fill="both")
+
+        # ── Info bar ──────────────────────────────────────────────────────────
+        info_label = tk.Label(win, text="", font=("Arial", 10))
+        info_label.pack(pady=(4, 0))
+
+        # ── Button bar ────────────────────────────────────────────────────────
+        btn_frame = tk.Frame(win)
+        btn_frame.pack(pady=8)
+
+        def _cleanup_tmp():
+            p = state.get("tmp_path")
+            if p and os.path.exists(p):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+            state["tmp_path"] = None
+
+        def load_current():
+            _cleanup_tmp()
+            remaining = len(state["images"]) - state["index"]
+            if state["index"] >= len(state["images"]):
+                img_label.config(image="", text="✓ All images classified!", fg="white", bg="black",
+                                 font=("Arial", 16, "bold"))
+                state["tk_img"] = None
+                info_label.config(text="No more images to classify.")
+                return
+
+            img_name = state["images"][state["index"]]
+            img_path = os.path.join(unclassified_folder, img_name)
+            total = len(state["images"])
+            info_label.config(text=f"Image {state['index'] + 1} of {total}  —  {img_name}  ({remaining} remaining)")
+
+            img_cv = cv2.imread(img_path)
+            if img_cv is None:
+                img_label.config(image="", text=f"⚠ Could not load:\n{img_name}",
+                                 fg="red", bg="black", font=("Arial", 11))
+                state["tk_img"] = None
+                return
+
+            max_w, max_h = _CLASSIFY_IMG_MAX_W, _CLASSIFY_IMG_MAX_H
+            h, w = img_cv.shape[:2]
+            scale = min(max_w / w, max_h / h, 1.0)
+            disp = cv2.resize(img_cv, (int(w * scale), int(h * scale)))
+
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".png")
+            os.close(tmp_fd)
+            cv2.imwrite(tmp_path, disp)
+            state["tmp_path"] = tmp_path
+
+            try:
+                tk_img = tk.PhotoImage(file=tmp_path)
+                state["tk_img"] = tk_img
+                img_label.config(image=tk_img, text="", bg="black")
+            except Exception:
+                img_label.config(image="", text=f"⚠ Display error:\n{img_name}",
+                                 fg="red", bg="black", font=("Arial", 11))
+                state["tk_img"] = None
+
+        def classify(label):
+            if state["index"] >= len(state["images"]):
+                return
+            img_name = state["images"][state["index"]]
+            src_path = os.path.join(unclassified_folder, img_name)
+
+            dest_folder = self._get_training_class_folder(label)
+            os.makedirs(dest_folder, exist_ok=True)
+
+            dest_path = os.path.join(dest_folder, img_name)
+            base, ext = os.path.splitext(dest_path)
+            counter = 1
+            while os.path.exists(dest_path):
+                dest_path = f"{base}_{counter}{ext}"
+                counter += 1
+
+            try:
+                shutil.move(src_path, dest_path)
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not move image: {e}")
+                return
+
+            state["history"].append((dest_path, src_path))
+            state["index"] += 1
+            self.update_training_stats()
+            load_current()
+
+        def undo():
+            if not state["history"]:
+                messagebox.showinfo("Undo", "Nothing to undo.")
+                return
+            dest_path, src_path = state["history"].pop()
+            try:
+                shutil.move(dest_path, src_path)
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not undo: {e}")
+                return
+            state["index"] = max(0, state["index"] - 1)
+            self.update_training_stats()
+            load_current()
+
+        tk.Button(btn_frame, text="✓  Open", bg="#90EE90", font=("Arial", 11, "bold"),
+                  command=lambda: classify("open"), width=10).pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_frame, text="✗  Closed", bg="#FFB6C1", font=("Arial", 11, "bold"),
+                  command=lambda: classify("closed"), width=10).pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_frame, text="?  Other", bg="#FFE08A", font=("Arial", 11, "bold"),
+                  command=lambda: classify("other"), width=10).pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_frame, text="↩  Undo", font=("Arial", 11),
+                  command=undo, width=8).pack(side=tk.LEFT, padx=6)
+
+        def _on_classify_close():
+            _cleanup_tmp()
+            win.destroy()
+
+        tk.Button(btn_frame, text="Close", command=_on_classify_close,
+                  width=8).pack(side=tk.LEFT, padx=6)
+
+        win.protocol("WM_DELETE_WINDOW", _on_classify_close)
+
+        load_current()
 
     def convert_fits_to_png(self):
         """Convert FITS images to PNG with debayering and stretching"""
