@@ -394,20 +394,26 @@ class RoofClassifierApp:
         tk.Entry(td_folder_entry_frame, textvariable=self.training_data_folder, width=40).pack(side=tk.LEFT, fill="x", expand=True)
         tk.Button(td_folder_entry_frame, text="Browse...", command=self.browse_training_data_folder).pack(side=tk.RIGHT, padx=(5, 0))
 
-        # Action buttons row
-        action_frame = tk.Frame(train_frame)
-        action_frame.pack(fill="x", pady=2)
-        tk.Button(action_frame, text="Add Frame (Open)", command=lambda: self.add_frame("open")).pack(side=tk.LEFT, padx=5)
-        tk.Button(action_frame, text="Add Frame (Closed)", command=lambda: self.add_frame("closed")).pack(side=tk.LEFT, padx=5)
-        tk.Button(action_frame, text="Clear Training Data", command=self.clear_training_data).pack(side=tk.LEFT, padx=5)
-        tk.Button(action_frame, text="Classify Unclassified Images", command=self.open_classify_images_window).pack(side=tk.LEFT, padx=5)
+        # Action buttons — two rows to avoid truncation on narrow panels
+        action_frame1 = tk.Frame(train_frame)
+        action_frame1.pack(fill="x", pady=(2, 1))
+        tk.Button(action_frame1, text="Add Frame (Open)", command=lambda: self.add_frame("open")).pack(side=tk.LEFT, padx=5)
+        tk.Button(action_frame1, text="Add Frame (Closed)", command=lambda: self.add_frame("closed")).pack(side=tk.LEFT, padx=5)
 
-        # Random sampling mode row
+        action_frame2 = tk.Frame(train_frame)
+        action_frame2.pack(fill="x", pady=(1, 2))
+        tk.Button(action_frame2, text="Clear Training Data", command=self.clear_training_data).pack(side=tk.LEFT, padx=5)
+        tk.Button(action_frame2, text="Classify Images", command=self.open_classify_images_window).pack(side=tk.LEFT, padx=5)
+
+        # Random sampling mode — split across two lines to avoid overflow on narrow panels
         sample_frame = tk.Frame(train_frame)
         sample_frame.pack(fill="x", pady=2)
-        tk.Checkbutton(sample_frame, text="Save random samples for classification  Rate (0–1):",
-                       variable=self.sample_mode_enabled, command=self.save_settings).pack(side=tk.LEFT)
-        tk.Entry(sample_frame, textvariable=self.sample_rate, width=5).pack(side=tk.LEFT, padx=(2, 0))
+        tk.Checkbutton(sample_frame, text="Save random samples for classification",
+                       variable=self.sample_mode_enabled, command=self.save_settings).pack(anchor="w")
+        sample_rate_frame = tk.Frame(train_frame)
+        sample_rate_frame.pack(fill="x", pady=(0, 2))
+        tk.Label(sample_rate_frame, text="Sample rate (0–1):").pack(side=tk.LEFT, padx=(5, 2))
+        tk.Entry(sample_rate_frame, textvariable=self.sample_rate, width=5).pack(side=tk.LEFT)
 
         # Stats display
         self.stats_label = tk.Label(train_frame, text="Training set: Open: 0, Closed: 0", fg="blue")
@@ -418,13 +424,19 @@ class RoofClassifierApp:
         model_frame = tk.LabelFrame(tab_train, text="Model", padx=5, pady=5)
         model_frame.pack(fill="x", padx=10, pady=5)
 
-        model_btn_frame = tk.Frame(model_frame)
-        model_btn_frame.pack(fill="x", pady=2)
-        tk.Button(model_btn_frame, text="Train Model", command=self.train_model).pack(side=tk.LEFT, padx=5)
-        tk.Button(model_btn_frame, text="Load Model", command=self.load_model).pack(side=tk.LEFT, padx=5)
-        tk.Button(model_btn_frame, text="Validate Model", command=self.validate_model).pack(side=tk.LEFT, padx=5)
-        tk.Button(model_btn_frame, text="Save Model As...", command=self.save_current_model_as).pack(side=tk.LEFT, padx=5)
-        tk.Button(model_btn_frame, text="Benchmark Models", command=self.benchmark_models).pack(side=tk.LEFT, padx=5)
+        model_btn_frame1 = tk.Frame(model_frame)
+        model_btn_frame1.pack(fill="x", pady=(2, 1))
+        tk.Button(model_btn_frame1, text="Train Model", command=self.train_model).pack(side=tk.LEFT, padx=5)
+        tk.Button(model_btn_frame1, text="Load Model", command=self.load_model).pack(side=tk.LEFT, padx=5)
+
+        model_btn_frame2 = tk.Frame(model_frame)
+        model_btn_frame2.pack(fill="x", pady=(1, 1))
+        tk.Button(model_btn_frame2, text="Validate Model", command=self.validate_model).pack(side=tk.LEFT, padx=5)
+        tk.Button(model_btn_frame2, text="Save Model As...", command=self.save_current_model_as).pack(side=tk.LEFT, padx=5)
+
+        model_btn_frame3 = tk.Frame(model_frame)
+        model_btn_frame3.pack(fill="x", pady=(1, 2))
+        tk.Button(model_btn_frame3, text="Benchmark Models", command=self.benchmark_models).pack(side=tk.LEFT, padx=5)
 
         # Model path with browse button
         model_path_frame = tk.Frame(model_frame)
@@ -581,17 +593,21 @@ class RoofClassifierApp:
             tk.Label(ascom_config_frame, text="Device Number:").pack(side=tk.LEFT)
             tk.Entry(ascom_config_frame, textvariable=self.ascom_device_number, width=6).pack(side=tk.LEFT, padx=(2,10))
 
-            # Manual control buttons
-            ascom_buttons_frame = tk.Frame(ascom_frame)
-            ascom_buttons_frame.pack(fill="x", pady=2)
+            # Manual control buttons — two rows to avoid truncation on narrow panels
+            ascom_buttons_frame1 = tk.Frame(ascom_frame)
+            ascom_buttons_frame1.pack(fill="x", pady=(2, 1))
 
-            tk.Button(ascom_buttons_frame, text="Start ASCOM Server",
+            tk.Button(ascom_buttons_frame1, text="Start ASCOM Server",
                      command=self.start_ascom_server).pack(side=tk.LEFT, padx=5)
-            tk.Button(ascom_buttons_frame, text="Stop ASCOM Server",
+            tk.Button(ascom_buttons_frame1, text="Stop ASCOM Server",
                      command=self.stop_ascom_server).pack(side=tk.LEFT, padx=5)
-            tk.Button(ascom_buttons_frame, text="Test Discovery",
+
+            ascom_buttons_frame2 = tk.Frame(ascom_frame)
+            ascom_buttons_frame2.pack(fill="x", pady=(1, 2))
+
+            tk.Button(ascom_buttons_frame2, text="Test Discovery",
                      command=self.test_ascom_discovery).pack(side=tk.LEFT, padx=5)
-            tk.Button(ascom_buttons_frame, text="Open Setup Page",
+            tk.Button(ascom_buttons_frame2, text="Open Setup Page",
                      command=self.open_ascom_setup_page).pack(side=tk.LEFT, padx=5)
 
             # Information
