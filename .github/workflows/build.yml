@@ -85,14 +85,17 @@ jobs:
             Write-Host "[SUCCESS] Build completed!"
             Write-Host "File size: $([math]::Round($fileInfo.Length / 1MB, 2)) MB"
             
-            # Test the executable
+            # Test the executable with a timeout (it's a GUI app so it won't exit on its own)
             echo "Testing executable runtime dependencies..."
-            & "dist/Synthetic_RoofStatusFile.exe" --version 2>&1 | Out-Host
-            if ($LASTEXITCODE -eq 0) {
-              Write-Host "[SUCCESS] Executable runs successfully"
+            $proc = Start-Process -FilePath "dist/Synthetic_RoofStatusFile.exe" -PassThru
+            $exited = $proc.WaitForExit(15000)
+            if (-not $exited) {
+              Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+              Write-Host "[SUCCESS] Executable launched successfully (GUI app terminated after timeout)"
+            } elseif ($proc.ExitCode -eq 0) {
+              Write-Host "[SUCCESS] Executable ran and exited cleanly"
             } else {
-              Write-Host "[WARN] Executable may have issues (exit code: $LASTEXITCODE)"
-              Write-Host "This may be normal if the app requires GUI interaction"
+              Write-Host "[WARN] Executable exited with code: $($proc.ExitCode)"
             }
           } else {
             Write-Error "Build failed - executable not found"
