@@ -579,7 +579,7 @@ class RoofClassifierApp:
         return hashes
 
     def add_frame(self, label):
-        files = filedialog.askopenfilenames(filetypes=[("Image files", "*.png *.jpg *.jpeg"), ("PNG files", "*.png"), ("JPEG files", "*.jpg *.jpeg")])
+        files = filedialog.askopenfilenames(filetypes=[("Image files", "*.png *.jpg *.jpeg"), ("All files", "*.*")])
         if not files:
             return
         os.makedirs(label, exist_ok=True)
