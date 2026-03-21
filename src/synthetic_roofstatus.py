@@ -38,8 +38,6 @@ IMG_SIZE = 32
 SETTINGS_FILE = "roof_classifier_settings.json"
 
 # Image display size constants
-_PREVIEW_IMG_MAX_W = 800   # max width when previewing the latest monitor image
-_PREVIEW_IMG_MAX_H = 600   # max height when previewing the latest monitor image
 _CLASSIFY_IMG_MAX_W = 820  # max width in the classify-images window (leaves room for button bar)
 _CLASSIFY_IMG_MAX_H = 460  # max height in the classify-images window
 
@@ -78,6 +76,7 @@ class RoofClassifierApp:
         self.training_data_folder = tk.StringVar(value="")
         self.sample_mode_enabled = tk.BooleanVar(value=False)
         self.sample_rate = tk.StringVar(value="0.1")
+        self.validation_set_path = tk.StringVar(value="")
 
         self.model = None
         self.stop_monitor = False
@@ -116,6 +115,7 @@ class RoofClassifierApp:
                     self.training_data_folder.set(settings.get('training_data_folder', ''))
                     self.sample_mode_enabled.set(settings.get('sample_mode_enabled', False))
                     self.sample_rate.set(settings.get('sample_rate', '0.1'))
+                    self.validation_set_path.set(settings.get('validation_set_path', ''))
         except Exception as e:
             print(f"Error loading settings: {e}")
 
@@ -139,7 +139,8 @@ class RoofClassifierApp:
                 'ascom_device_number': self.ascom_device_number.get(),
                 'training_data_folder': self.training_data_folder.get(),
                 'sample_mode_enabled': self.sample_mode_enabled.get(),
-                'sample_rate': self.sample_rate.get()
+                'sample_rate': self.sample_rate.get(),
+                'validation_set_path': self.validation_set_path.get()
             }
             with open(SETTINGS_FILE, 'w') as f:
                 json.dump(settings, f, indent=2)
@@ -391,7 +392,6 @@ class RoofClassifierApp:
         tk.Button(action_frame, text="Add Frame (Open)", command=lambda: self.add_frame("open")).pack(side=tk.LEFT, padx=5)
         tk.Button(action_frame, text="Add Frame (Closed)", command=lambda: self.add_frame("closed")).pack(side=tk.LEFT, padx=5)
         tk.Button(action_frame, text="Clear Training Data", command=self.clear_training_data).pack(side=tk.LEFT, padx=5)
-        tk.Button(action_frame, text="Preview Latest Image", command=self.preview_latest_image).pack(side=tk.LEFT, padx=5)
         tk.Button(action_frame, text="Classify Unclassified Images", command=self.open_classify_images_window).pack(side=tk.LEFT, padx=5)
 
         # Random sampling mode row
@@ -409,12 +409,15 @@ class RoofClassifierApp:
         # Model section
         model_frame = tk.LabelFrame(self.root, text="Model", padx=5, pady=5)
         model_frame.pack(fill="x", padx=10, pady=5)
-        
-        tk.Button(model_frame, text="Train Model", command=self.train_model).pack(side=tk.LEFT, padx=5)
-        tk.Button(model_frame, text="Load Model", command=self.load_model).pack(side=tk.LEFT, padx=5)
-        tk.Button(model_frame, text="Validate Model", command=self.validate_model).pack(side=tk.LEFT, padx=5)
-        tk.Button(model_frame, text="Save Model As...", command=self.save_current_model_as).pack(side=tk.LEFT, padx=5)
-        
+
+        model_btn_frame = tk.Frame(model_frame)
+        model_btn_frame.pack(fill="x", pady=2)
+        tk.Button(model_btn_frame, text="Train Model", command=self.train_model).pack(side=tk.LEFT, padx=5)
+        tk.Button(model_btn_frame, text="Load Model", command=self.load_model).pack(side=tk.LEFT, padx=5)
+        tk.Button(model_btn_frame, text="Validate Model", command=self.validate_model).pack(side=tk.LEFT, padx=5)
+        tk.Button(model_btn_frame, text="Save Model As...", command=self.save_current_model_as).pack(side=tk.LEFT, padx=5)
+        tk.Button(model_btn_frame, text="Benchmark Models", command=self.benchmark_models).pack(side=tk.LEFT, padx=5)
+
         # Model path with browse button
         model_path_frame = tk.Frame(model_frame)
         model_path_frame.pack(fill="x", pady=5)
@@ -423,6 +426,15 @@ class RoofClassifierApp:
         path_entry_frame.pack(fill="x")
         tk.Entry(path_entry_frame, textvariable=self.model_path, width=40).pack(side=tk.LEFT, fill="x", expand=True)
         tk.Button(path_entry_frame, text="Browse...", command=self.browse_model_path).pack(side=tk.RIGHT, padx=(5,0))
+
+        # Fixed validation set path
+        val_set_frame = tk.Frame(model_frame)
+        val_set_frame.pack(fill="x", pady=2)
+        tk.Label(val_set_frame, text="Fixed Validation Set Folder:").pack(anchor="w")
+        val_set_entry_frame = tk.Frame(val_set_frame)
+        val_set_entry_frame.pack(fill="x")
+        tk.Entry(val_set_entry_frame, textvariable=self.validation_set_path, width=40).pack(side=tk.LEFT, fill="x", expand=True)
+        tk.Button(val_set_entry_frame, text="Browse...", command=self.browse_validation_set).pack(side=tk.RIGHT, padx=(5, 0))
 
         # Monitoring section
         monitor_frame = tk.LabelFrame(self.root, text="Monitoring", padx=5, pady=5)
@@ -757,45 +769,29 @@ class RoofClassifierApp:
         return img
 
     def validate_model(self):
-        """Run validation on a separate set of test images"""
+        """Run validation on a set of test images.
+
+        Uses the fixed validation set if one is configured; otherwise prompts the
+        user to choose a folder.
+        """
         if not self.model:
             messagebox.showerror("Error", "Load or train a model first.")
             return
-            
-        # Let user select validation folder
-        folder = filedialog.askdirectory(title="Select folder with validation images")
-        if not folder:
+
+        fixed = self.validation_set_path.get().strip()
+        if fixed:
+            folder = fixed
+        else:
+            folder = filedialog.askdirectory(title="Select folder with validation images")
+            if not folder:
+                return
+
+        try:
+            X_val, y_val, file_names = self._load_validation_data(folder)
+        except ValueError as e:
+            messagebox.showerror("Error", str(e))
             return
-            
-        # Look for 'open' and 'closed' subfolders
-        open_folder = os.path.join(folder, "open")
-        closed_folder = os.path.join(folder, "closed")
-        
-        if not os.path.isdir(open_folder) and not os.path.isdir(closed_folder):
-            messagebox.showerror("Error", "Validation folder must contain 'open' and/or 'closed' subfolders.")
-            return
-            
-        X_val, y_val, file_names = [], [], []
-        
-        # Load validation data
-        for label, val in [("open", 1), ("closed", 0)]:
-            val_folder = os.path.join(folder, label)
-            if not os.path.isdir(val_folder):
-                continue
-            for file in os.listdir(val_folder):
-                if file.lower().endswith((".png", ".jpg", ".jpeg")):
-                    try:
-                        img = self.prep_image(os.path.join(val_folder, file))
-                        X_val.append(img.flatten())
-                        y_val.append(val)
-                        file_names.append(f"{label}/{file}")
-                    except Exception as e:
-                        print(f"Error processing {file}: {e}")
-                        
-        if not X_val:
-            messagebox.showerror("Error", "No validation images found.")
-            return
-            
+
         # Make predictions
         X_val = np.array(X_val)
         y_pred = self.model.predict(X_val)
@@ -1092,64 +1088,167 @@ class RoofClassifierApp:
             self.save_settings()
             self.update_training_stats()
 
-    def preview_latest_image(self):
-        """Preview the most recent image in the monitor folder"""
-        folder = self.monitor_path.get().strip()
+    def browse_validation_set(self):
+        """Browse for a fixed validation set folder."""
+        current = self.validation_set_path.get().strip()
+        initial_dir = current if current and os.path.isdir(current) else os.getcwd()
+        folder = filedialog.askdirectory(
+            title="Select Fixed Validation Set Folder (must contain open/ and/or closed/ subfolders)",
+            initialdir=initial_dir
+        )
+        if folder:
+            self.validation_set_path.set(folder)
+            self.save_settings()
+
+    def _load_validation_data(self, folder):
+        """Load images from open/ and closed/ subfolders of *folder*.
+
+        Returns (X, y, file_names) where X is a list of flattened image arrays,
+        y is a list of int labels (1=open, 0=closed), and file_names are relative paths.
+        Raises ValueError with a human-readable message when no images can be loaded.
+        """
         if not folder or not os.path.isdir(folder):
-            messagebox.showerror("Error", "Please set a valid Monitor Folder first.")
+            raise ValueError("Validation set folder not found.")
+
+        open_folder = os.path.join(folder, "open")
+        closed_folder = os.path.join(folder, "closed")
+        if not os.path.isdir(open_folder) and not os.path.isdir(closed_folder):
+            raise ValueError("Validation folder must contain 'open' and/or 'closed' subfolders.")
+
+        X, y, file_names = [], [], []
+        for label, val in [("open", 1), ("closed", 0)]:
+            sub = os.path.join(folder, label)
+            if not os.path.isdir(sub):
+                continue
+            for file in sorted(os.listdir(sub)):
+                if file.lower().endswith((".png", ".jpg", ".jpeg")):
+                    try:
+                        img = self.prep_image(os.path.join(sub, file))
+                        X.append(img.flatten())
+                        y.append(val)
+                        file_names.append(f"{label}/{file}")
+                    except Exception as e:
+                        print(f"Error processing {file}: {e}")
+
+        if not X:
+            raise ValueError("No validation images found in the selected folder.")
+
+        return X, y, file_names
+
+    def benchmark_models(self):
+        """Run one or more .joblib models against the fixed validation set and compare results."""
+        val_folder = self.validation_set_path.get().strip()
+        if not val_folder:
+            messagebox.showerror(
+                "No Validation Set",
+                "Please set a Fixed Validation Set Folder in the Model section first."
+            )
             return
-
-        images = [f for f in os.listdir(folder) if f.lower().endswith((".png", ".jpg", ".jpeg"))]
-        if not images:
-            messagebox.showinfo("No Images", "No image files found in the monitor folder.")
-            return
-
-        latest = max(images, key=lambda f: os.path.getmtime(os.path.join(folder, f)))
-        self._show_image_in_window(os.path.join(folder, latest), f"Preview: {latest}")
-
-    def _show_image_in_window(self, img_path, title="Image Preview"):
-        """Display an image file in a pop-up Toplevel window."""
-        img_cv = cv2.imread(img_path)
-        if img_cv is None:
-            messagebox.showerror("Error", f"Could not load image:\n{img_path}")
-            return
-
-        win = tk.Toplevel(self.root)
-        win.title(title)
-
-        # Scale image to fit inside the configured preview area
-        max_w, max_h = _PREVIEW_IMG_MAX_W, _PREVIEW_IMG_MAX_H
-        h, w = img_cv.shape[:2]
-        scale = min(max_w / w, max_h / h, 1.0)
-        disp = cv2.resize(img_cv, (int(w * scale), int(h * scale)))
-
-        # Write to a temporary PNG so tk.PhotoImage can load it (no Pillow needed)
-        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".png")
-        os.close(tmp_fd)
-        cv2.imwrite(tmp_path, disp)
 
         try:
-            tk_img = tk.PhotoImage(file=tmp_path)
-        except Exception as e:
-            os.unlink(tmp_path)
-            messagebox.showerror("Error", f"Could not display image: {e}")
-            win.destroy()
+            X_val, y_val, file_names = self._load_validation_data(val_folder)
+        except ValueError as e:
+            messagebox.showerror("Validation Set Error", str(e))
             return
 
-        lbl = tk.Label(win, image=tk_img)
-        lbl.image = tk_img  # keep reference alive
-        lbl.pack()
-        tk.Label(win, text=img_path, fg="gray", font=("Arial", 8)).pack()
+        model_files = filedialog.askopenfilenames(
+            title="Select one or more model files to benchmark",
+            filetypes=[("Joblib model", "*.joblib"), ("All files", "*.*")]
+        )
+        if not model_files:
+            return
 
-        def _on_preview_close():
-            if os.path.exists(tmp_path):
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-            win.destroy()
+        X_arr = np.array(X_val)
+        results = []
+        errors = []
+        for path in model_files:
+            try:
+                mdl = load(path)
+                y_pred = mdl.predict(X_arr)
+                acc = accuracy_score(y_val, y_pred)
+                cm = confusion_matrix(y_val, y_pred)
+                results.append((os.path.basename(path), acc, cm, y_pred, path))
+            except Exception as e:
+                errors.append(f"{os.path.basename(path)}: {e}")
 
-        win.protocol("WM_DELETE_WINDOW", _on_preview_close)
+        if not results and errors:
+            messagebox.showerror("Benchmark Error", "\n".join(errors))
+            return
+
+        self._show_benchmark_results(results, y_val, file_names, errors)
+
+    def _show_benchmark_results(self, results, y_true, file_names, errors):
+        """Display a side-by-side benchmark comparison in a Toplevel window."""
+        win = tk.Toplevel(self.root)
+        win.title("Model Benchmark Results")
+        win.geometry("800x550")
+        win.resizable(True, True)
+
+        # ── Summary table ─────────────────────────────────────────────────────
+        summary_frame = tk.LabelFrame(win, text="Summary", padx=5, pady=5)
+        summary_frame.pack(fill="x", padx=10, pady=5)
+
+        headers = ["Model", "Accuracy", "TN", "FP", "FN", "TP"]
+        for col, h in enumerate(headers):
+            tk.Label(summary_frame, text=h, font=("Arial", 9, "bold"),
+                     relief="ridge", width=14 if col == 0 else 7,
+                     anchor="w").grid(row=0, column=col, sticky="ew", padx=1, pady=1)
+
+        best_acc = max(r[1] for r in results) if results else 0.0
+        for row_idx, (name, acc, cm, _, _) in enumerate(results, start=1):
+            if cm.shape == (2, 2):
+                tn, fp, fn, tp = cm[0, 0], cm[0, 1], cm[1, 0], cm[1, 1]
+            else:
+                if self.logger:
+                    self.logger.warning(
+                        f"Unexpected confusion matrix shape {cm.shape} for model '{name}'. "
+                        "Ensure validation data contains both classes."
+                    )
+                tn, fp, fn, tp = "N/A", "N/A", "N/A", "N/A"
+            bold = ("Arial", 9, "bold") if acc == best_acc else ("Arial", 9)
+            fg = "darkgreen" if acc == best_acc else "black"
+            values = [name, f"{acc:.4f} ({acc*100:.1f}%)", tn, fp, fn, tp]
+            for col, val in enumerate(values):
+                tk.Label(summary_frame, text=str(val), font=bold, fg=fg,
+                         relief="ridge", width=14 if col == 0 else 7,
+                         anchor="w").grid(row=row_idx, column=col, sticky="ew", padx=1, pady=1)
+
+        if errors:
+            err_label = tk.Label(summary_frame,
+                                 text="Failed: " + "; ".join(errors),
+                                 fg="red", font=("Arial", 8), wraplength=760, justify=tk.LEFT)
+            err_label.grid(row=len(results) + 1, column=0, columnspan=6, sticky="w", pady=(4, 0))
+
+        # ── Per-image detail ──────────────────────────────────────────────────
+        detail_frame = tk.LabelFrame(win, text="Per-Image Results", padx=5, pady=5)
+        detail_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+        # Build column headers: File | True | Model1 | Model2 | ...
+        col_headers = ["File", "True"] + [r[0] for r in results]
+        tree = ttk.Treeview(detail_frame, columns=col_headers, show="headings")
+        for ch in col_headers:
+            tree.heading(ch, text=ch)
+            tree.column(ch, width=80 if ch not in ("File",) else 200, anchor="center")
+        tree.column("File", anchor="w")
+
+        vertical_scrollbar = ttk.Scrollbar(detail_frame, orient="vertical", command=tree.yview)
+        horizontal_scrollbar = ttk.Scrollbar(detail_frame, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=vertical_scrollbar.set, xscrollcommand=horizontal_scrollbar.set)
+
+        for i, (fname, true_val) in enumerate(zip(file_names, y_true)):
+            true_str = "OPEN" if true_val == 1 else "CLOSED"
+            preds = []
+            for _, _, _, y_pred, _ in results:
+                p_str = "OPEN" if y_pred[i] == 1 else "CLOSED"
+                marker = "✓" if y_pred[i] == true_val else "✗"
+                preds.append(f"{marker} {p_str}")
+            tree.insert("", tk.END, values=[fname, true_str] + preds)
+
+        tree.grid(row=0, column=0, sticky="nsew")
+        vertical_scrollbar.grid(row=0, column=1, sticky="ns")
+        horizontal_scrollbar.grid(row=1, column=0, sticky="ew")
+        detail_frame.rowconfigure(0, weight=1)
+        detail_frame.columnconfigure(0, weight=1)
 
     def save_sample_if_needed(self, img_path):
         """Randomly copy an image to the unclassified folder when sampling mode is active."""
