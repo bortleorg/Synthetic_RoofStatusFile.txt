@@ -150,6 +150,21 @@ class RoofClassifierApp:
         except Exception as e:
             print(f"Error saving settings: {e}")
 
+    def _log_path_conflicts_with_output(self):
+        """Return True if the classifier log path resolves to the same file as the roof status output path."""
+        return os.path.abspath(self.log_path.get()) == os.path.abspath(self.output_path.get())
+
+    def _warn_log_path_conflict(self, extra_hint=""):
+        """Show a warning dialog when the log path conflicts with the roof status output path."""
+        hint = f" {extra_hint}" if extra_hint else ""
+        messagebox.showwarning(
+            "Log Path Conflict",
+            f"The classifier log file path is the same as the roof status output file:\n\n"
+            f"  {self.output_path.get()}\n\n"
+            f"File logging has been disabled to protect the roof status file."
+            f"{hint}"
+        )
+
     def setup_logging(self):
         """Setup logging configuration"""
         if hasattr(self, 'logger') and self.logger:
@@ -159,18 +174,30 @@ class RoofClassifierApp:
         
         self.logger = logging.getLogger('RoofClassifier')
         self.logger.setLevel(logging.INFO)
+        # Prevent classifier log messages from propagating to the root logger,
+        # which could cause them to appear in unexpected handlers.
+        self.logger.propagate = False
         
         # Create formatter
         formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
         
         if self.log_enabled.get():
-            try:
-                # File handler
-                file_handler = logging.FileHandler(self.log_path.get())
-                file_handler.setFormatter(formatter)
-                self.logger.addHandler(file_handler)
-            except Exception as e:
-                print(f"Error setting up file logging: {e}")
+            log_path = self.log_path.get()
+            # Guard: do not let the classifier log file handler write to the same
+            # file as the roof status output file.  If both paths resolve to the
+            # same file the diagnostic log entries would corrupt the roof status
+            # file format that downstream tools (e.g. ASCOM safety monitors) depend on.
+            if self._log_path_conflicts_with_output():
+                print(f"Warning: Log file path '{log_path}' is the same as the roof status output file. "
+                      f"File logging disabled to protect the roof status file.")
+            else:
+                try:
+                    # File handler
+                    file_handler = logging.FileHandler(log_path)
+                    file_handler.setFormatter(formatter)
+                    self.logger.addHandler(file_handler)
+                except Exception as e:
+                    print(f"Error setting up file logging: {e}")
         
         # Console handler (always enabled)
         console_handler = logging.StreamHandler()
@@ -1057,6 +1084,11 @@ class RoofClassifierApp:
         # Setup logging with current settings
         self.setup_logging()
         
+        # Warn if the classifier log file is the same as the roof status output file.
+        # This would cause diagnostic log entries to corrupt the roof status file format.
+        if self.log_enabled.get() and self._log_path_conflicts_with_output():
+            self._warn_log_path_conflict("Please set a different path for the classifier log file in the Configuration tab.")
+        
         self.stop_monitor = False
         self.monitoring_active = True
         self.status_label.config(text="Monitoring: Starting...", fg="blue")
@@ -1891,6 +1923,8 @@ class RoofClassifierApp:
 
     def on_log_enabled_changed(self):
         """Called when logging checkbox is toggled"""
+        if self.log_enabled.get() and self._log_path_conflicts_with_output():
+            self._warn_log_path_conflict("Please set a different path for the classifier log file.")
         self.setup_logging()
         self.save_settings()
 
@@ -1905,6 +1939,14 @@ class RoofClassifierApp:
             initialdir=initial_dir
         )
         if path:
+            if os.path.abspath(path) == os.path.abspath(self.output_path.get()):
+                messagebox.showerror(
+                    "Invalid Log File Path",
+                    f"The classifier log file cannot be the same as the roof status output file:\n\n"
+                    f"  {self.output_path.get()}\n\n"
+                    f"Please choose a different file for the classifier log."
+                )
+                return
             self.log_path.set(path)
             self.setup_logging()
             self.save_settings()
