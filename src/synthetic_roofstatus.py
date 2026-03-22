@@ -79,12 +79,15 @@ class RoofClassifierApp:
         self.validation_set_path = tk.StringVar(value="")
 
         self.model = None
-        self.stop_monitor = False
+        self.stop_monitor = True
+        self.monitoring_active = False
         self.logger = None
         self.ascom_server = None
+        self._startup_model_error = None
         self.load_settings()
         self.setup_logging()
         self.setup_gui()
+        self._try_load_model_from_settings()
 
     def load_settings(self):
         """Load settings from JSON file"""
@@ -173,6 +176,21 @@ class RoofClassifierApp:
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(formatter)
         self.logger.addHandler(console_handler)
+
+    def _try_load_model_from_settings(self):
+        """Auto-load the model stored in settings so monitoring is ready on startup"""
+        path = self.model_path.get()
+        if path and os.path.isfile(path):
+            try:
+                self.model = load(path)
+                if self.logger:
+                    self.logger.info(f"Auto-loaded model from {path}")
+            except Exception as e:
+                msg = f"Failed to auto-load model from {path}: {e}"
+                if self.logger:
+                    self.logger.error(msg)
+                # Defer the messagebox until after the main loop starts so the UI is visible
+                self.root.after(500, lambda m=msg: messagebox.showerror("Model Load Error", m))
 
     def start_ascom_server(self):
         """Start the ASCOM Alpaca server"""
@@ -373,6 +391,23 @@ class RoofClassifierApp:
             return None, None
 
     def setup_gui(self):
+        # ── Persistent status bar (always visible at the bottom) ─────────────
+        statusbar_frame = tk.Frame(self.root, bd=1, relief=tk.SUNKEN)
+        statusbar_frame.pack(side=tk.BOTTOM, fill=tk.X)
+
+        self.statusbar_label = tk.Label(
+            statusbar_frame, text="● Monitoring: Off", fg="gray",
+            anchor="w", padx=6, font=("Arial", 9)
+        )
+        self.statusbar_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        self.statusbar_toggle_btn = tk.Button(
+            statusbar_frame, text="Start Monitoring",
+            command=self.toggle_monitoring, pady=0, padx=6,
+            font=("Arial", 9)
+        )
+        self.statusbar_toggle_btn.pack(side=tk.RIGHT, padx=4, pady=1)
+
         # Top-level notebook for tabbed layout
         notebook = ttk.Notebook(self.root)
         notebook.pack(fill="both", expand=True, padx=5, pady=5)
@@ -408,7 +443,7 @@ class RoofClassifierApp:
         # Random sampling mode — split across two lines to avoid overflow on narrow panels
         sample_frame = tk.Frame(train_frame)
         sample_frame.pack(fill="x", pady=2)
-        tk.Checkbutton(sample_frame, text="Save random samples for classification",
+        tk.Checkbutton(sample_frame, text="Save random samples while monitoring (requires monitoring to be active)",
                        variable=self.sample_mode_enabled, command=self.save_settings).pack(anchor="w")
         sample_rate_frame = tk.Frame(train_frame)
         sample_rate_frame.pack(fill="x", pady=(0, 2))
@@ -441,7 +476,7 @@ class RoofClassifierApp:
         # Model path with browse button
         model_path_frame = tk.Frame(model_frame)
         model_path_frame.pack(fill="x", pady=5)
-        tk.Label(model_path_frame, text="Default Save Path for New Models:").pack(anchor="w")
+        tk.Label(model_path_frame, text="Current Model:").pack(anchor="w")
         path_entry_frame = tk.Frame(model_path_frame)
         path_entry_frame.pack(fill="x")
         tk.Entry(path_entry_frame, textvariable=self.model_path, width=40).pack(side=tk.LEFT, fill="x", expand=True)
@@ -950,8 +985,10 @@ class RoofClassifierApp:
                 status_text += " | Secondary: N/A"
             
             self.status_label.config(text=status_text, fg="green")
+            self.statusbar_label.config(text=f"● Monitoring: Active — {status}", fg="green")
         else:
             self.status_label.config(text="Monitoring: Error checking files", fg="red")
+            self.statusbar_label.config(text="● Monitoring: Active — Error", fg="red")
 
     def update_countdown(self, seconds_remaining):
         """Update the countdown display"""
@@ -968,8 +1005,11 @@ class RoofClassifierApp:
 
     def clear_monitoring_status(self):
         """Clear the monitoring status when stopped"""
+        self.monitoring_active = False
         self.status_label.config(text="Monitoring: Stopped", fg="gray")
         self.countdown_label.config(text="")
+        self.statusbar_label.config(text="● Monitoring: Off", fg="gray")
+        self.statusbar_toggle_btn.config(text="Start Monitoring")
 
     def monitor_loop(self):
         check_interval = 60  # 60 seconds between checks
@@ -989,11 +1029,22 @@ class RoofClassifierApp:
         # Clear status when monitoring stops
         self.root.after(0, self.clear_monitoring_status)
 
+    def toggle_monitoring(self):
+        """Toggle monitoring on or off from the status bar button"""
+        if self.monitoring_active:
+            self.stop_monitoring()
+        else:
+            self.start_monitoring()
+
     def start_monitoring(self):
         if not self.model:
             messagebox.showerror("Error", "Load or train a model first.")
             return
         
+        if self.monitoring_active:
+            messagebox.showwarning("Warning", "Monitoring is already active.")
+            return
+
         # Validate configuration
         try:
             float(self.latitude.get())
@@ -1007,8 +1058,11 @@ class RoofClassifierApp:
         self.setup_logging()
         
         self.stop_monitor = False
+        self.monitoring_active = True
         self.status_label.config(text="Monitoring: Starting...", fg="blue")
         self.countdown_label.config(text="")
+        self.statusbar_label.config(text="● Monitoring: Active", fg="green")
+        self.statusbar_toggle_btn.config(text="Stop Monitoring")
         
         if self.logger:
             self.logger.info("Monitoring started")
@@ -1021,27 +1075,28 @@ class RoofClassifierApp:
         
         threading.Thread(target=self.monitor_loop, daemon=True).start()
         self.update_observation_window_display()  # Start periodic updates
-        messagebox.showinfo("Started", "Monitoring started.")
 
     def stop_monitoring(self):
         self.stop_monitor = True
         if self.logger:
             self.logger.info("Monitoring stopped")
-        messagebox.showinfo("Stopped", "Monitoring stopped.")
 
     def browse_model_path(self):
-        """Browse for default model save location for new trained models"""
+        """Browse for and load an existing model file"""
         current_path = self.model_path.get()
         initial_dir = os.path.dirname(current_path) if current_path else os.getcwd()
-        path = filedialog.asksaveasfilename(
-            title="Select Default Save Location for New Models",
-            defaultextension=".joblib",
+        path = filedialog.askopenfilename(
+            title="Select Model to Load",
             filetypes=[("Joblib model", "*.joblib"), ("All files", "*.*")],
             initialdir=initial_dir
         )
         if path:
-            self.model_path.set(path)
-            self.save_settings()
+            try:
+                self.model = load(path)
+                self.model_path.set(path)
+                self.save_settings()
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to load model: {e}")
 
     def save_current_model_as(self):
         """Save the currently loaded model to a new location"""
@@ -1461,6 +1516,8 @@ class RoofClassifierApp:
                   command=lambda: classify("closed"), width=10).pack(side=tk.LEFT, padx=6)
         tk.Button(btn_frame, text="?  Other", bg="#FFE08A", font=("Arial", 11, "bold"),
                   command=lambda: classify("other"), width=10).pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_frame, text="🗑  Discard", bg="#D3D3D3", font=("Arial", 11),
+                  command=lambda: classify("discard"), width=10).pack(side=tk.LEFT, padx=6)
         tk.Button(btn_frame, text="↩  Undo", font=("Arial", 11),
                   command=undo, width=8).pack(side=tk.LEFT, padx=6)
 
