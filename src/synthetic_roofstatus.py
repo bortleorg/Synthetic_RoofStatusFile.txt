@@ -443,7 +443,7 @@ class RoofClassifierApp:
         # Random sampling mode — split across two lines to avoid overflow on narrow panels
         sample_frame = tk.Frame(train_frame)
         sample_frame.pack(fill="x", pady=2)
-        tk.Checkbutton(sample_frame, text="Save random samples for classification",
+        tk.Checkbutton(sample_frame, text="Save random samples while monitoring (requires monitoring to be active)",
                        variable=self.sample_mode_enabled, command=self.save_settings).pack(anchor="w")
         sample_rate_frame = tk.Frame(train_frame)
         sample_rate_frame.pack(fill="x", pady=(0, 2))
@@ -1516,6 +1516,8 @@ class RoofClassifierApp:
                   command=lambda: classify("closed"), width=10).pack(side=tk.LEFT, padx=6)
         tk.Button(btn_frame, text="?  Other", bg="#FFE08A", font=("Arial", 11, "bold"),
                   command=lambda: classify("other"), width=10).pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_frame, text="🗑  Discard", bg="#D3D3D3", font=("Arial", 11),
+                  command=lambda: classify("discard"), width=10).pack(side=tk.LEFT, padx=6)
         tk.Button(btn_frame, text="↩  Undo", font=("Arial", 11),
                   command=undo, width=8).pack(side=tk.LEFT, padx=6)
 
