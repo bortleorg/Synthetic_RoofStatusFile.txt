@@ -14,7 +14,7 @@
 The file format looks like this:
 
 ```
-2025-06-23 09:39:36AM Roof Status: OPEN
+???2025-06-23 09:39:36AM Roof Status: OPEN
 ```
 
 ## Usage
