@@ -9,16 +9,13 @@
 - The app trains a lightweight logistic regression model using these examples.
 - Once trained, it watches a user-selected folder.
 - Every 60 seconds, it checks for the newest image in that folder.
-- It classifies the image as `OPEN` or `CLOSED` and appends a timestamped entry to a `.txt` file.
+- It classifies the image as `OPEN` or `CLOSED` and overwrites the `.txt` file with the current status as a single line.
 
-The log format looks like this:
+The file format looks like this:
 
 ```
-2025-06-23 09:39:36 UTC Roof Status: OPEN
-2025-06-23 11:07:47 UTC Roof Status: CLOSED
+???2025-06-23 09:39:36AM Roof Status: OPEN
 ```
-
-All timestamps are in UTC. If the sun angle safety check overrides the classification, the reason is noted in the log line.
 
 ## Usage
 

@@ -976,7 +976,7 @@ class RoofClassifierApp:
             override_reason = ""
         
         # Log the analysis
-        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        now = datetime.now().strftime("%Y-%m-%d %I:%M:%S%p")
         sun_angle = self.calculate_sun_angle()
         
         log_message = f"Image: {latest}, Raw prediction: {image_status}, Final status: {final_status}"
@@ -990,9 +990,10 @@ class RoofClassifierApp:
         if self.logger:
             self.logger.info(log_message)
         
-        # Write to output file
-        line = f"{now} Roof Status: {final_status}{override_reason}\n"
-        with open(self.output_path.get(), "a") as f:
+        # Write to output file (overwrite with current status as a single line)
+        # Format follows the SRO Roof File spec: https://interactiveastronomy.com/skyroof_help/SROrooffile.html
+        line = f"???{now} Roof Status: {final_status}{override_reason}\n"
+        with open(self.output_path.get(), "w") as f:
             f.write(line)
         
         print(f"[{final_status}] {latest}")
