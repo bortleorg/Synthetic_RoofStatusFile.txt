@@ -7,9 +7,10 @@
 - You collect a set of example images (`.png`, `.jpg`, or `.jpeg`) of the roof in the open and closed positions.
 - You label them using the app (assign each image to "open" or "closed").
 - The app trains a lightweight logistic regression model using these examples.
-- Once trained, it watches a user-selected folder.
-- Every 60 seconds, it checks for the newest image in that folder.
-- It classifies the image as `OPEN` or `CLOSED` and overwrites the `.txt` file with the current status as a single line.
+- Once trained, it watches a user-selected folder **or downloads the latest image from a remote camera URL**.
+- Every 60 seconds, it checks for the newest image and classifies it as `OPEN` or `CLOSED`.
+- The result is written to the output `.txt` file as a single line.
+- The app tracks a hash of each image so it can detect stale (unchanged) images and alert you via the UI or webhooks.
 
 The file format looks like this:
 
@@ -19,7 +20,7 @@ The file format looks like this:
 
 ## Usage
 
-The app is organized into four tabs: **Training & Model**, **Monitoring**, **Configuration**, and **Utilities**.
+The app is organized into five tabs: **Training & Model**, **Monitoring**, **Configuration**, **Notifications**, and **Utilities**.
 
 ### Training & Model
 
@@ -34,12 +35,17 @@ The app is organized into four tabs: **Training & Model**, **Monitoring**, **Con
 
 To build up the training set over time, enable **"Save random samples while monitoring"** and set a sample rate (for example, `0.1` saves roughly 10% of checked frames to an `unclassified/` subfolder). Click **"Classify Images"** to work through those images and move each one to `open/`, `closed/`, `other/`, or discard it.
 
+When classifying images, if a model is loaded it automatically runs inference on each image. A **"🤖 Model predicts: OPEN"** (green) or **"🤖 Model predicts: CLOSED"** (red) label appears below the image counter, and the corresponding button receives a highlighted border, so the predicted class is immediately visible.
+
 ### Monitoring
 
 1. Set the **Monitor Folder** (the folder where your camera saves images).
-2. Set the **Output Status File** path (`RoofStatusFile.txt` is the default).
-3. Click **"Start Monitoring"** to begin. The status bar at the bottom of the window shows the current state and provides a quick toggle button.
-4. The app checks the newest image every 60 seconds and appends a line to the output file.
+2. Optionally set a **Camera Image URL** instead of a folder. When set, the app downloads the image from that URL on each cycle rather than reading from disk. Use the **"Test"** button to verify the URL is reachable before starting. If both are set, the URL takes precedence.
+3. Set the **Output Status File** path (`RoofStatusFile.txt` is the default).
+4. Click **"Start Monitoring"** to begin. The status bar at the bottom of the window shows the current state and provides a quick toggle button.
+5. The app checks the newest image every 60 seconds and appends a line to the output file.
+
+The Monitoring tab also shows **"Image last changed: X min ago"** — the elapsed time since the image hash last changed. This turns orange when the image has not changed for longer than the stale threshold (configured in the Notifications tab). The status bar additionally shows a `⚠ stale image` warning in orange when the image is stale.
 
 ### Configuration
 
@@ -59,6 +65,34 @@ The calculated observation window (next sunset and sunrise in UTC) is displayed 
 **Secondary Roof Status File** — Enable this option and point it at another `RoofStatusFile.txt`-format file to cross-reference a second source. The secondary status is shown in the monitoring display and logged alongside each primary classification, but it does not override the primary decision.
 
 **ASCOM Alpaca Safety Monitor** — The app can serve an ASCOM Alpaca-compatible Safety Monitor API on a configurable port (default 11111). Enable it here and configure the port and device number. N.I.N.A. and other ASCOM clients can auto-discover the device via UDP port 32227 or connect manually. Use **"Test Discovery"** to verify the network setup, and **"Open Setup Page"** to view the Alpaca setup endpoint in a browser.
+
+### Notifications
+
+Four independently configurable outbound webhook sections. Each section has an enable checkbox, a webhook URL field, and a **"Test"** button that sends a test POST request. All settings persist to `roof_classifier_settings.json`.
+
+Webhooks are HTTP POST requests with a JSON body. The `event` field identifies the trigger:
+
+| Section | `event` value | Trigger condition |
+|---|---|---|
+| Stale Image | `image_stale` | Image hash unchanged for ≥ stale threshold; re-fires every threshold interval while still stale |
+| Roof Open | `roof_open` | Status transitions to OPEN (not sent on every cycle) |
+| Roof Closed | `roof_closed` | Status transitions to CLOSED (not sent on every cycle) |
+| Heartbeat | `heartbeat` | Every X minutes while monitoring is active **and** the image is not stale |
+
+**Stale Image Notification** — Set the stale threshold in minutes (default: 10). If the image hash has not changed for that long, a webhook fires. It re-fires once per threshold interval for as long as the image remains unchanged.
+
+**Roof Open / Closed Notifications** — Fire once each time the status transitions to OPEN or CLOSED, respectively.
+
+**Heartbeat Notification** — Set the interval in minutes (default: 5). A heartbeat fires on every cycle once the interval has elapsed, as long as monitoring is running and the image is **not** stale. The heartbeat is suppressed automatically during stale periods, using the same threshold defined in the Stale Image section. This makes the heartbeat useful as a "all is well" signal — its absence indicates either monitoring stopped or the image feed has gone silent.
+
+Example payloads:
+
+```json
+{ "event": "image_stale", "status": "CLOSED", "stale_minutes": 14.2, "timestamp": "2025-06-01T02:10:00Z" }
+{ "event": "roof_open",   "status": "OPEN",   "timestamp": "2025-06-01T02:11:00Z" }
+{ "event": "roof_closed", "status": "CLOSED", "timestamp": "2025-06-01T02:30:00Z" }
+{ "event": "heartbeat",   "status": "OPEN",   "timestamp": "2025-06-01T02:35:00Z" }
+```
 
 ### Utilities
 

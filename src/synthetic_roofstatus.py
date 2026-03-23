@@ -13,6 +13,8 @@ import hashlib
 import json
 import logging
 import shutil
+import urllib.request
+import urllib.error
 import random
 import tempfile
 import ephem
@@ -71,6 +73,30 @@ class RoofClassifierApp:
         self.ascom_enabled = tk.BooleanVar(value=False)
         self.ascom_port = tk.StringVar(value="11111")
         self.ascom_device_number = tk.StringVar(value="0")
+
+        # Camera URL for remote image source
+        self.camera_url = tk.StringVar(value="")
+
+        # Image hash tracking state
+        self.last_image_hash = None
+        self.last_new_hash_time = None  # datetime (UTC) when hash last changed
+
+        # State tracking for roof open/close transition notifications
+        self.previous_status = None
+        self._last_stale_notification_time = None
+        self._last_heartbeat_time = None
+
+        # Notification settings
+        self.notif_stale_enabled = tk.BooleanVar(value=False)
+        self.notif_stale_minutes = tk.StringVar(value="10")
+        self.notif_stale_url = tk.StringVar(value="")
+        self.notif_open_enabled = tk.BooleanVar(value=False)
+        self.notif_open_url = tk.StringVar(value="")
+        self.notif_closed_enabled = tk.BooleanVar(value=False)
+        self.notif_closed_url = tk.StringVar(value="")
+        self.notif_heartbeat_enabled = tk.BooleanVar(value=False)
+        self.notif_heartbeat_minutes = tk.StringVar(value="5")
+        self.notif_heartbeat_url = tk.StringVar(value="")
         
         # Training set management configuration
         self.training_data_folder = tk.StringVar(value="")
@@ -119,6 +145,21 @@ class RoofClassifierApp:
                     self.sample_mode_enabled.set(settings.get('sample_mode_enabled', False))
                     self.sample_rate.set(settings.get('sample_rate', '0.1'))
                     self.validation_set_path.set(settings.get('validation_set_path', ''))
+
+                    # Camera URL
+                    self.camera_url.set(settings.get('camera_url', ''))
+
+                    # Notification settings
+                    self.notif_stale_enabled.set(settings.get('notif_stale_enabled', False))
+                    self.notif_stale_minutes.set(settings.get('notif_stale_minutes', '10'))
+                    self.notif_stale_url.set(settings.get('notif_stale_url', ''))
+                    self.notif_open_enabled.set(settings.get('notif_open_enabled', False))
+                    self.notif_open_url.set(settings.get('notif_open_url', ''))
+                    self.notif_closed_enabled.set(settings.get('notif_closed_enabled', False))
+                    self.notif_closed_url.set(settings.get('notif_closed_url', ''))
+                    self.notif_heartbeat_enabled.set(settings.get('notif_heartbeat_enabled', False))
+                    self.notif_heartbeat_minutes.set(settings.get('notif_heartbeat_minutes', '5'))
+                    self.notif_heartbeat_url.set(settings.get('notif_heartbeat_url', ''))
         except Exception as e:
             print(f"Error loading settings: {e}")
 
@@ -143,7 +184,18 @@ class RoofClassifierApp:
                 'training_data_folder': self.training_data_folder.get(),
                 'sample_mode_enabled': self.sample_mode_enabled.get(),
                 'sample_rate': self.sample_rate.get(),
-                'validation_set_path': self.validation_set_path.get()
+                'validation_set_path': self.validation_set_path.get(),
+                'camera_url': self.camera_url.get(),
+                'notif_stale_enabled': self.notif_stale_enabled.get(),
+                'notif_stale_minutes': self.notif_stale_minutes.get(),
+                'notif_stale_url': self.notif_stale_url.get(),
+                'notif_open_enabled': self.notif_open_enabled.get(),
+                'notif_open_url': self.notif_open_url.get(),
+                'notif_closed_enabled': self.notif_closed_enabled.get(),
+                'notif_closed_url': self.notif_closed_url.get(),
+                'notif_heartbeat_enabled': self.notif_heartbeat_enabled.get(),
+                'notif_heartbeat_minutes': self.notif_heartbeat_minutes.get(),
+                'notif_heartbeat_url': self.notif_heartbeat_url.get(),
             }
             with open(SETTINGS_FILE, 'w') as f:
                 json.dump(settings, f, indent=2)
@@ -543,6 +595,15 @@ class RoofClassifierApp:
         tk.Entry(output_entry_frame, textvariable=self.output_path, width=40).pack(side=tk.LEFT, fill="x", expand=True)
         tk.Button(output_entry_frame, text="Browse...", command=self.browse_output_file).pack(side=tk.RIGHT, padx=(5,0))
 
+        # Camera URL row
+        camera_url_outer = tk.Frame(monitor_frame)
+        camera_url_outer.pack(fill="x", pady=2)
+        tk.Label(camera_url_outer, text="Camera Image URL (optional, overrides folder):").pack(anchor="w")
+        camera_url_inner = tk.Frame(camera_url_outer)
+        camera_url_inner.pack(fill="x")
+        tk.Entry(camera_url_inner, textvariable=self.camera_url, width=40).pack(side=tk.LEFT, fill="x", expand=True)
+        tk.Button(camera_url_inner, text="Test", command=self._test_camera_url).pack(side=tk.RIGHT, padx=(5, 0))
+
         button_frame = tk.Frame(monitor_frame)
         button_frame.pack(pady=5)
         tk.Button(button_frame, text="Start Monitoring", command=self.start_monitoring).pack(side=tk.LEFT, padx=5)
@@ -555,6 +616,9 @@ class RoofClassifierApp:
         self.status_label.pack()
         self.countdown_label = tk.Label(status_frame, text="", fg="blue")
         self.countdown_label.pack()
+        self.hash_status_label = tk.Label(status_frame, text="Image hash: Not monitoring", fg="gray",
+                                          font=("Arial", 8))
+        self.hash_status_label.pack()
 
         # ── Tab 3: Configuration ──────────────────────────────────────────────
         tab_config = ttk.Frame(notebook)
@@ -698,7 +762,96 @@ class RoofClassifierApp:
                          "Run: pip install flask flask-cors",
                     fg="red", justify=tk.LEFT).pack(anchor="w")
 
-        # ── Tab 4: Utilities ──────────────────────────────────────────────────
+        # ── Tab 4: Notifications ─────────────────────────────────────────────
+        tab_notif = ttk.Frame(notebook)
+        notebook.add(tab_notif, text="Notifications")
+
+        # Stale image notification section
+        stale_frame = tk.LabelFrame(tab_notif, text="Stale Image Notification", padx=5, pady=5)
+        stale_frame.pack(fill="x", padx=10, pady=5)
+
+        tk.Checkbutton(stale_frame, text="Notify when the latest image has not changed for X minutes",
+                       variable=self.notif_stale_enabled, command=self.save_settings).pack(anchor="w")
+
+        stale_min_frame = tk.Frame(stale_frame)
+        stale_min_frame.pack(fill="x", pady=2)
+        tk.Label(stale_min_frame, text="Stale threshold (minutes):").pack(side=tk.LEFT)
+        tk.Entry(stale_min_frame, textvariable=self.notif_stale_minutes, width=6).pack(side=tk.LEFT, padx=(5, 0))
+
+        stale_url_outer = tk.Frame(stale_frame)
+        stale_url_outer.pack(fill="x", pady=2)
+        tk.Label(stale_url_outer, text="Webhook URL:").pack(anchor="w")
+        stale_url_inner = tk.Frame(stale_url_outer)
+        stale_url_inner.pack(fill="x")
+        tk.Entry(stale_url_inner, textvariable=self.notif_stale_url, width=40).pack(side=tk.LEFT, fill="x", expand=True)
+        tk.Button(stale_url_inner, text="Test",
+                  command=lambda: self._test_webhook(self.notif_stale_url)).pack(side=tk.RIGHT, padx=(5, 0))
+
+        # Roof open notification section
+        open_frame = tk.LabelFrame(tab_notif, text="Roof Open Notification", padx=5, pady=5)
+        open_frame.pack(fill="x", padx=10, pady=5)
+
+        tk.Checkbutton(open_frame, text="Notify when the roof opens",
+                       variable=self.notif_open_enabled, command=self.save_settings).pack(anchor="w")
+
+        open_url_outer = tk.Frame(open_frame)
+        open_url_outer.pack(fill="x", pady=2)
+        tk.Label(open_url_outer, text="Webhook URL:").pack(anchor="w")
+        open_url_inner = tk.Frame(open_url_outer)
+        open_url_inner.pack(fill="x")
+        tk.Entry(open_url_inner, textvariable=self.notif_open_url, width=40).pack(side=tk.LEFT, fill="x", expand=True)
+        tk.Button(open_url_inner, text="Test",
+                  command=lambda: self._test_webhook(self.notif_open_url)).pack(side=tk.RIGHT, padx=(5, 0))
+
+        # Roof closed notification section
+        closed_frame = tk.LabelFrame(tab_notif, text="Roof Closed Notification", padx=5, pady=5)
+        closed_frame.pack(fill="x", padx=10, pady=5)
+
+        tk.Checkbutton(closed_frame, text="Notify when the roof closes",
+                       variable=self.notif_closed_enabled, command=self.save_settings).pack(anchor="w")
+
+        closed_url_outer = tk.Frame(closed_frame)
+        closed_url_outer.pack(fill="x", pady=2)
+        tk.Label(closed_url_outer, text="Webhook URL:").pack(anchor="w")
+        closed_url_inner = tk.Frame(closed_url_outer)
+        closed_url_inner.pack(fill="x")
+        tk.Entry(closed_url_inner, textvariable=self.notif_closed_url, width=40).pack(side=tk.LEFT, fill="x", expand=True)
+        tk.Button(closed_url_inner, text="Test",
+                  command=lambda: self._test_webhook(self.notif_closed_url)).pack(side=tk.RIGHT, padx=(5, 0))
+
+        # Heartbeat notification section
+        heartbeat_frame = tk.LabelFrame(tab_notif, text="Heartbeat Notification", padx=5, pady=5)
+        heartbeat_frame.pack(fill="x", padx=10, pady=5)
+
+        tk.Checkbutton(heartbeat_frame,
+                       text="Send periodic heartbeat while monitoring is active (image must not be stale)",
+                       variable=self.notif_heartbeat_enabled, command=self.save_settings).pack(anchor="w")
+
+        hb_min_frame = tk.Frame(heartbeat_frame)
+        hb_min_frame.pack(fill="x", pady=2)
+        tk.Label(hb_min_frame, text="Interval (minutes):").pack(side=tk.LEFT)
+        tk.Entry(hb_min_frame, textvariable=self.notif_heartbeat_minutes, width=6).pack(side=tk.LEFT, padx=(5, 0))
+
+        hb_url_outer = tk.Frame(heartbeat_frame)
+        hb_url_outer.pack(fill="x", pady=2)
+        tk.Label(hb_url_outer, text="Webhook URL:").pack(anchor="w")
+        hb_url_inner = tk.Frame(hb_url_outer)
+        hb_url_inner.pack(fill="x")
+        tk.Entry(hb_url_inner, textvariable=self.notif_heartbeat_url, width=40).pack(side=tk.LEFT, fill="x", expand=True)
+        tk.Button(hb_url_inner, text="Test",
+                  command=lambda: self._test_webhook(self.notif_heartbeat_url)).pack(side=tk.RIGHT, padx=(5, 0))
+
+        # Help text
+        notif_help_frame = tk.Frame(tab_notif)
+        notif_help_frame.pack(fill="x", padx=10, pady=5)
+        tk.Label(notif_help_frame,
+                 text=("Webhooks are HTTP POST requests with a JSON body.\n"
+                       "Payload fields: event, status, timestamp (and stale_minutes for stale events).\n"
+                       "Open/closed notifications fire only on transitions (not every cycle).\n"
+                       "Heartbeat is suppressed when the image is stale (uses the Stale threshold above)."),
+                 fg="darkgreen", font=("Arial", 8), justify=tk.LEFT).pack(anchor="w")
+
+        # ── Tab 5: Utilities ──────────────────────────────────────────────────
         tab_utils = ttk.Frame(notebook)
         notebook.add(tab_utils, text="Utilities")
 
@@ -938,23 +1091,51 @@ class RoofClassifierApp:
         text_widget.config(state=tk.DISABLED)
 
     def classify_latest_png(self):
-        folder = self.monitor_path.get()
-        if not self.model or not os.path.isdir(folder):
+        if not self.model:
             if self.logger:
-                self.logger.error("No model loaded or invalid monitor folder")
-            return None, "No model or invalid folder"
-        
-        images = [f for f in os.listdir(folder) if f.lower().endswith((".png", ".jpg", ".jpeg"))]
-        if not images:
-            if self.logger:
-                self.logger.warning("No image files found in monitor folder")
-            return None, "No image files found"
-        
-        latest = max(images, key=lambda f: os.path.getmtime(os.path.join(folder, f)))
-        img_path = os.path.join(folder, latest)
+                self.logger.error("No model loaded")
+            return None, "No model loaded"
 
-        # Optionally save a random sample for manual classification
-        self.save_sample_if_needed(img_path)
+        camera_url = self.camera_url.get().strip()
+        tmp_path = None
+
+        if camera_url:
+            # URL mode: download the latest image from the configured URL
+            tmp_path = self._fetch_image_from_url(camera_url)
+            if tmp_path is None:
+                return None, "Failed to fetch image from URL"
+            img_path = tmp_path
+            latest = camera_url
+        else:
+            # Folder mode: find the newest image in the monitor folder
+            folder = self.monitor_path.get()
+            if not os.path.isdir(folder):
+                if self.logger:
+                    self.logger.error("No model loaded or invalid monitor folder")
+                return None, "No model or invalid folder"
+
+            images = [f for f in os.listdir(folder) if f.lower().endswith((".png", ".jpg", ".jpeg"))]
+            if not images:
+                if self.logger:
+                    self.logger.warning("No image files found in monitor folder")
+                return None, "No image files found"
+
+            latest = max(images, key=lambda f: os.path.getmtime(os.path.join(folder, f)))
+            img_path = os.path.join(folder, latest)
+
+            # Optionally save a random sample for manual classification
+            self.save_sample_if_needed(img_path)
+
+        # Track image file hash to detect when a new image arrives
+        try:
+            with open(img_path, 'rb') as f:
+                file_hash = hashlib.md5(f.read()).hexdigest()
+            if file_hash != self.last_image_hash:
+                self.last_image_hash = file_hash
+                self.last_new_hash_time = datetime.utcnow()
+        except Exception as e:
+            if self.logger:
+                self.logger.warning(f"Could not compute image hash for {img_path}: {e}")
 
         # Get secondary source status for comparison
         secondary_status, secondary_time = self.read_secondary_source()
@@ -995,6 +1176,13 @@ class RoofClassifierApp:
         line = f"???{now} Roof Status: {final_status}{override_reason}\n"
         with open(self.output_path.get(), "w") as f:
             f.write(line)
+
+        # Clean up temp file for URL mode
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
         
         print(f"[{final_status}] {latest}")
         return latest, final_status
@@ -1013,7 +1201,16 @@ class RoofClassifierApp:
                 status_text += " | Secondary: N/A"
             
             self.status_label.config(text=status_text, fg="green")
-            self.statusbar_label.config(text=f"● Monitoring: Active — {status}", fg="green")
+
+            # Update hash/stale display and check for stale warning
+            stale_warning = self._update_hash_status_display()
+
+            if stale_warning:
+                self.statusbar_label.config(
+                    text=f"⚠ Monitoring: Active — {status} (stale image)", fg="darkorange"
+                )
+            else:
+                self.statusbar_label.config(text=f"● Monitoring: Active — {status}", fg="green")
         else:
             self.status_label.config(text="Monitoring: Error checking files", fg="red")
             self.statusbar_label.config(text="● Monitoring: Active — Error", fg="red")
@@ -1038,6 +1235,226 @@ class RoofClassifierApp:
         self.countdown_label.config(text="")
         self.statusbar_label.config(text="● Monitoring: Off", fg="gray")
         self.statusbar_toggle_btn.config(text="Start Monitoring")
+        if hasattr(self, 'hash_status_label'):
+            self.hash_status_label.config(text="Image hash: Not monitoring", fg="gray")
+
+    # ── New feature helpers ───────────────────────────────────────────────────
+
+    def _fetch_image_from_url(self, url):
+        """Download an image from *url* to a temporary file. Returns the temp file path,
+        or None if the download fails."""
+        tmp_path = None
+        try:
+            suffix = ".jpg"
+            for ext in (".png", ".jpg", ".jpeg"):
+                if url.lower().split("?")[0].endswith(ext):
+                    suffix = ext
+                    break
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+            os.close(tmp_fd)
+            req = urllib.request.Request(url, headers={"User-Agent": "SyntheticRoofStatus/1.0"})
+            with urllib.request.urlopen(req, timeout=15) as response:
+                data = response.read()
+            with open(tmp_path, "wb") as f:
+                f.write(data)
+            return tmp_path
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"Failed to fetch image from URL {url}: {e}")
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+            return None
+
+    def _send_webhook(self, url, payload):
+        """Send an HTTP POST request to *url* with *payload* encoded as JSON."""
+        try:
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as response:
+                if self.logger:
+                    self.logger.info(f"Webhook sent to {url}: HTTP {response.status}")
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"Failed to send webhook to {url}: {e}")
+
+    def _check_and_send_notifications(self, status):
+        """Check notification conditions and fire webhooks as appropriate.
+
+        Called from the monitor background thread after each classification cycle.
+        """
+        now = datetime.utcnow()
+        ts = now.isoformat() + "Z"
+
+        # Roof open transition notification
+        if self.notif_open_enabled.get() and status == "OPEN" and self.previous_status != "OPEN":
+            url = self.notif_open_url.get().strip()
+            if url:
+                self._send_webhook(url, {"event": "roof_open", "status": status, "timestamp": ts})
+
+        # Roof closed transition notification
+        if self.notif_closed_enabled.get() and status == "CLOSED" and self.previous_status != "CLOSED":
+            url = self.notif_closed_url.get().strip()
+            if url:
+                self._send_webhook(url, {"event": "roof_closed", "status": status, "timestamp": ts})
+
+        self.previous_status = status
+
+        # Stale image notification.
+        # The notification is sent once when the image first becomes stale, then re-sent
+        # after every additional stale_minutes interval while the image remains unchanged.
+        stale_minutes_val = 10.0
+        elapsed_minutes = 0.0
+        is_stale = False
+        if self.last_new_hash_time is not None:
+            try:
+                stale_minutes_val = float(self.notif_stale_minutes.get())
+            except ValueError:
+                stale_minutes_val = 10.0
+            elapsed_minutes = (now - self.last_new_hash_time).total_seconds() / 60.0
+            is_stale = elapsed_minutes >= stale_minutes_val
+
+        if self.notif_stale_enabled.get() and is_stale:
+            url = self.notif_stale_url.get().strip()
+            if url:
+                # Re-send at most once per stale_minutes interval
+                already_sent = (
+                    self._last_stale_notification_time is not None
+                    and (now - self._last_stale_notification_time).total_seconds() / 60.0 < stale_minutes_val
+                )
+                if not already_sent:
+                    self._send_webhook(url, {
+                        "event": "image_stale",
+                        "status": status,
+                        "stale_minutes": round(elapsed_minutes, 1),
+                        "timestamp": ts,
+                    })
+                    self._last_stale_notification_time = now
+
+        # Heartbeat notification — fires every heartbeat_minutes interval while monitoring is
+        # active, but is suppressed whenever the image is stale.
+        if self.notif_heartbeat_enabled.get() and not is_stale:
+            url = self.notif_heartbeat_url.get().strip()
+            if url:
+                try:
+                    heartbeat_minutes = float(self.notif_heartbeat_minutes.get())
+                except ValueError:
+                    heartbeat_minutes = 5.0
+                interval_elapsed = (
+                    self._last_heartbeat_time is None
+                    or (now - self._last_heartbeat_time).total_seconds() / 60.0 >= heartbeat_minutes
+                )
+                if interval_elapsed:
+                    self._send_webhook(url, {"event": "heartbeat", "status": status, "timestamp": ts})
+                    self._last_heartbeat_time = now
+
+    def _update_hash_status_display(self):
+        """Refresh the image hash status label. Returns True if the image is considered stale."""
+        if not hasattr(self, "hash_status_label"):
+            return False
+
+        if self.last_new_hash_time is None:
+            self.hash_status_label.config(text="Image hash: Waiting for first check...", fg="gray")
+            return False
+
+        now = datetime.utcnow()
+        elapsed_seconds = (now - self.last_new_hash_time).total_seconds()
+        elapsed_minutes = elapsed_seconds / 60.0
+
+        if elapsed_minutes < 1:
+            elapsed_str = f"{int(elapsed_seconds)}s ago"
+        elif elapsed_minutes < 60:
+            elapsed_str = f"{elapsed_minutes:.1f} min ago"
+        else:
+            elapsed_str = f"{elapsed_minutes / 60.0:.1f} hr ago"
+
+        try:
+            stale_minutes = float(self.notif_stale_minutes.get())
+        except ValueError:
+            stale_minutes = 10.0
+
+        is_stale = elapsed_minutes >= stale_minutes
+
+        if is_stale:
+            self.hash_status_label.config(
+                text=f"⚠ Image last changed: {elapsed_str} (threshold: {stale_minutes:.0f} min)",
+                fg="darkorange",
+            )
+        else:
+            self.hash_status_label.config(
+                text=f"Image last changed: {elapsed_str}",
+                fg="darkgreen",
+            )
+        return is_stale
+
+    def _test_camera_url(self):
+        """Test downloading an image from the configured camera URL."""
+        url = self.camera_url.get().strip()
+        if not url:
+            messagebox.showwarning("No URL", "Please enter a camera image URL first.")
+            return
+
+        def do_test():
+            tmp_path = self._fetch_image_from_url(url)
+            if tmp_path:
+                try:
+                    img = cv2.imread(tmp_path)
+                    if img is not None:
+                        h, w = img.shape[:2]
+                        msg = f"Successfully downloaded image from URL.\nSize: {w}×{h} pixels"
+                    else:
+                        msg = ("Downloaded file but could not parse it as an image.\n"
+                               "Check that the URL points to a valid image file.")
+                    os.unlink(tmp_path)
+                    self.root.after(0, lambda m=msg: messagebox.showinfo("URL Test Success", m))
+                except Exception as e:
+                    self.root.after(0, lambda e=e: messagebox.showerror("URL Test Error", f"Error: {e}"))
+            else:
+                self.root.after(
+                    0,
+                    lambda: messagebox.showerror(
+                        "URL Test Failed",
+                        f"Failed to download image from:\n{url}\n\nCheck the URL and network connectivity.",
+                    ),
+                )
+
+        threading.Thread(target=do_test, daemon=True).start()
+
+    def _test_webhook(self, url_var):
+        """Send a test POST to the webhook URL stored in *url_var*."""
+        url = url_var.get().strip()
+        if not url:
+            messagebox.showwarning("No URL", "Please enter a webhook URL first.")
+            return
+
+        payload = {
+            "event": "test",
+            "status": "TEST",
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "message": "Test notification from Synthetic RoofStatusFile.txt",
+        }
+
+        def do_send():
+            try:
+                self._send_webhook(url, payload)
+                self.root.after(
+                    0,
+                    lambda: messagebox.showinfo(
+                        "Webhook Sent",
+                        f"Test webhook sent to:\n{url}\n\nCheck the destination for the payload.",
+                    ),
+                )
+            except Exception as e:
+                self.root.after(0, lambda e=e: messagebox.showerror("Webhook Error", f"Failed: {e}"))
+
+        threading.Thread(target=do_send, daemon=True).start()
 
     def monitor_loop(self):
         check_interval = 60  # 60 seconds between checks
@@ -1046,6 +1463,10 @@ class RoofClassifierApp:
             # Check the latest PNG and update status
             filename, status = self.classify_latest_png()
             self.root.after(0, lambda f=filename, s=status: self.update_monitoring_status(f, s))
+
+            # Send notifications if configured (runs in background thread)
+            if status in ("OPEN", "CLOSED"):
+                self._check_and_send_notifications(status)
             
             # Countdown loop with 1-second updates
             for remaining in range(check_interval, 0, -1):
@@ -1092,6 +1513,12 @@ class RoofClassifierApp:
         
         self.stop_monitor = False
         self.monitoring_active = True
+        # Reset notification state so transition and stale notifications work correctly
+        self.previous_status = None
+        self._last_stale_notification_time = None
+        self._last_heartbeat_time = None
+        self.last_image_hash = None
+        self.last_new_hash_time = None
         self.status_label.config(text="Monitoring: Starting...", fg="blue")
         self.countdown_label.config(text="")
         self.statusbar_label.config(text="● Monitoring: Active", fg="green")
@@ -1435,6 +1862,8 @@ class RoofClassifierApp:
             "history": [],
             "tk_img": None,   # keep PhotoImage alive
             "tmp_path": None, # last temp file to clean up
+            "open_btn": None,   # set after button creation; used by load_current for highlights
+            "closed_btn": None, # set after button creation; used by load_current for highlights
         }
 
         # ── Image display ─────────────────────────────────────────────────────
@@ -1447,6 +1876,10 @@ class RoofClassifierApp:
         # ── Info bar ──────────────────────────────────────────────────────────
         info_label = tk.Label(win, text="", font=("Arial", 10))
         info_label.pack(pady=(4, 0))
+
+        # ── Model prediction indicator ────────────────────────────────────────
+        pred_label = tk.Label(win, text="", font=("Arial", 10, "italic"), fg="gray")
+        pred_label.pack(pady=(0, 2))
 
         # ── Button bar ────────────────────────────────────────────────────────
         btn_frame = tk.Frame(win)
@@ -1469,6 +1902,10 @@ class RoofClassifierApp:
                                  font=("Arial", 16, "bold"))
                 state["tk_img"] = None
                 info_label.config(text="No more images to classify.")
+                pred_label.config(text="")
+                if state["open_btn"]:
+                    state["open_btn"].config(relief=tk.RAISED, bd=2)
+                    state["closed_btn"].config(relief=tk.RAISED, bd=2)
                 return
 
             img_name = state["images"][state["index"]]
@@ -1481,6 +1918,10 @@ class RoofClassifierApp:
                 img_label.config(image="", text=f"⚠ Could not load:\n{img_name}",
                                  fg="red", bg="black", font=("Arial", 11))
                 state["tk_img"] = None
+                pred_label.config(text="")
+                if state["open_btn"]:
+                    state["open_btn"].config(relief=tk.RAISED, bd=2)
+                    state["closed_btn"].config(relief=tk.RAISED, bd=2)
                 return
 
             max_w, max_h = _CLASSIFY_IMG_MAX_W, _CLASSIFY_IMG_MAX_H
@@ -1501,6 +1942,27 @@ class RoofClassifierApp:
                 img_label.config(image="", text=f"⚠ Display error:\n{img_name}",
                                  fg="red", bg="black", font=("Arial", 11))
                 state["tk_img"] = None
+
+            # ── Model prediction ─────────────────────────────────────────────
+            if state["open_btn"]:
+                state["open_btn"].config(relief=tk.RAISED, bd=2)
+                state["closed_btn"].config(relief=tk.RAISED, bd=2)
+            if self.model is not None:
+                try:
+                    arr = self.prep_image(img_path).flatten().reshape(1, -1)
+                    prediction = self.model.predict(arr)[0]
+                    if prediction == 1:
+                        pred_label.config(text="🤖 Model predicts: OPEN", fg="#228B22")
+                        if state["open_btn"]:
+                            state["open_btn"].config(relief=tk.SOLID, bd=3)
+                    else:
+                        pred_label.config(text="🤖 Model predicts: CLOSED", fg="#CC0000")
+                        if state["closed_btn"]:
+                            state["closed_btn"].config(relief=tk.SOLID, bd=3)
+                except Exception:
+                    pred_label.config(text="🤖 Model prediction unavailable", fg="gray")
+            else:
+                pred_label.config(text="(no model loaded — load one to see predictions)", fg="gray")
 
         def classify(label):
             if state["index"] >= len(state["images"]):
@@ -1543,10 +2005,16 @@ class RoofClassifierApp:
             self.update_training_stats()
             load_current()
 
-        tk.Button(btn_frame, text="✓  Open", bg="#90EE90", font=("Arial", 11, "bold"),
-                  command=lambda: classify("open"), width=10).pack(side=tk.LEFT, padx=6)
-        tk.Button(btn_frame, text="✗  Closed", bg="#FFB6C1", font=("Arial", 11, "bold"),
-                  command=lambda: classify("closed"), width=10).pack(side=tk.LEFT, padx=6)
+        open_btn = tk.Button(btn_frame, text="✓  Open", bg="#90EE90", font=("Arial", 11, "bold"),
+                             command=lambda: classify("open"), width=10)
+        open_btn.pack(side=tk.LEFT, padx=6)
+        closed_btn = tk.Button(btn_frame, text="✗  Closed", bg="#FFB6C1", font=("Arial", 11, "bold"),
+                               command=lambda: classify("closed"), width=10)
+        closed_btn.pack(side=tk.LEFT, padx=6)
+        # Store references so load_current can update button highlights
+        state["open_btn"] = open_btn
+        state["closed_btn"] = closed_btn
+
         tk.Button(btn_frame, text="?  Other", bg="#FFE08A", font=("Arial", 11, "bold"),
                   command=lambda: classify("other"), width=10).pack(side=tk.LEFT, padx=6)
         tk.Button(btn_frame, text="🗑  Discard", bg="#D3D3D3", font=("Arial", 11),
