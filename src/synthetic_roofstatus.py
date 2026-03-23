@@ -84,6 +84,7 @@ class RoofClassifierApp:
         # State tracking for roof open/close transition notifications
         self.previous_status = None
         self._last_stale_notification_time = None
+        self._last_heartbeat_time = None
 
         # Notification settings
         self.notif_stale_enabled = tk.BooleanVar(value=False)
@@ -93,6 +94,9 @@ class RoofClassifierApp:
         self.notif_open_url = tk.StringVar(value="")
         self.notif_closed_enabled = tk.BooleanVar(value=False)
         self.notif_closed_url = tk.StringVar(value="")
+        self.notif_heartbeat_enabled = tk.BooleanVar(value=False)
+        self.notif_heartbeat_minutes = tk.StringVar(value="5")
+        self.notif_heartbeat_url = tk.StringVar(value="")
         
         # Training set management configuration
         self.training_data_folder = tk.StringVar(value="")
@@ -153,6 +157,9 @@ class RoofClassifierApp:
                     self.notif_open_url.set(settings.get('notif_open_url', ''))
                     self.notif_closed_enabled.set(settings.get('notif_closed_enabled', False))
                     self.notif_closed_url.set(settings.get('notif_closed_url', ''))
+                    self.notif_heartbeat_enabled.set(settings.get('notif_heartbeat_enabled', False))
+                    self.notif_heartbeat_minutes.set(settings.get('notif_heartbeat_minutes', '5'))
+                    self.notif_heartbeat_url.set(settings.get('notif_heartbeat_url', ''))
         except Exception as e:
             print(f"Error loading settings: {e}")
 
@@ -186,6 +193,9 @@ class RoofClassifierApp:
                 'notif_open_url': self.notif_open_url.get(),
                 'notif_closed_enabled': self.notif_closed_enabled.get(),
                 'notif_closed_url': self.notif_closed_url.get(),
+                'notif_heartbeat_enabled': self.notif_heartbeat_enabled.get(),
+                'notif_heartbeat_minutes': self.notif_heartbeat_minutes.get(),
+                'notif_heartbeat_url': self.notif_heartbeat_url.get(),
             }
             with open(SETTINGS_FILE, 'w') as f:
                 json.dump(settings, f, indent=2)
@@ -809,13 +819,36 @@ class RoofClassifierApp:
         tk.Button(closed_url_inner, text="Test",
                   command=lambda: self._test_webhook(self.notif_closed_url)).pack(side=tk.RIGHT, padx=(5, 0))
 
+        # Heartbeat notification section
+        heartbeat_frame = tk.LabelFrame(tab_notif, text="Heartbeat Notification", padx=5, pady=5)
+        heartbeat_frame.pack(fill="x", padx=10, pady=5)
+
+        tk.Checkbutton(heartbeat_frame,
+                       text="Send periodic heartbeat while monitoring is active (image must not be stale)",
+                       variable=self.notif_heartbeat_enabled, command=self.save_settings).pack(anchor="w")
+
+        hb_min_frame = tk.Frame(heartbeat_frame)
+        hb_min_frame.pack(fill="x", pady=2)
+        tk.Label(hb_min_frame, text="Interval (minutes):").pack(side=tk.LEFT)
+        tk.Entry(hb_min_frame, textvariable=self.notif_heartbeat_minutes, width=6).pack(side=tk.LEFT, padx=(5, 0))
+
+        hb_url_outer = tk.Frame(heartbeat_frame)
+        hb_url_outer.pack(fill="x", pady=2)
+        tk.Label(hb_url_outer, text="Webhook URL:").pack(anchor="w")
+        hb_url_inner = tk.Frame(hb_url_outer)
+        hb_url_inner.pack(fill="x")
+        tk.Entry(hb_url_inner, textvariable=self.notif_heartbeat_url, width=40).pack(side=tk.LEFT, fill="x", expand=True)
+        tk.Button(hb_url_inner, text="Test",
+                  command=lambda: self._test_webhook(self.notif_heartbeat_url)).pack(side=tk.RIGHT, padx=(5, 0))
+
         # Help text
         notif_help_frame = tk.Frame(tab_notif)
         notif_help_frame.pack(fill="x", padx=10, pady=5)
         tk.Label(notif_help_frame,
                  text=("Webhooks are HTTP POST requests with a JSON body.\n"
                        "Payload fields: event, status, timestamp (and stale_minutes for stale events).\n"
-                       "Open/closed notifications fire only on transitions (not every cycle)."),
+                       "Open/closed notifications fire only on transitions (not every cycle).\n"
+                       "Heartbeat is suppressed when the image is stale (uses the Stale threshold above)."),
                  fg="darkgreen", font=("Arial", 8), justify=tk.LEFT).pack(anchor="w")
 
         # ── Tab 5: Utilities ──────────────────────────────────────────────────
@@ -1277,28 +1310,50 @@ class RoofClassifierApp:
         # Stale image notification.
         # The notification is sent once when the image first becomes stale, then re-sent
         # after every additional stale_minutes interval while the image remains unchanged.
-        if self.notif_stale_enabled.get() and self.last_new_hash_time is not None:
+        stale_minutes_val = 10.0
+        elapsed_minutes = 0.0
+        is_stale = False
+        if self.last_new_hash_time is not None:
             try:
-                stale_minutes = float(self.notif_stale_minutes.get())
+                stale_minutes_val = float(self.notif_stale_minutes.get())
             except ValueError:
-                stale_minutes = 10.0
+                stale_minutes_val = 10.0
             elapsed_minutes = (now - self.last_new_hash_time).total_seconds() / 60.0
-            if elapsed_minutes >= stale_minutes:
-                url = self.notif_stale_url.get().strip()
-                if url:
-                    # Re-send at most once per stale_minutes interval
-                    already_sent = (
-                        self._last_stale_notification_time is not None
-                        and (now - self._last_stale_notification_time).total_seconds() / 60.0 < stale_minutes
-                    )
-                    if not already_sent:
-                        self._send_webhook(url, {
-                            "event": "image_stale",
-                            "status": status,
-                            "stale_minutes": round(elapsed_minutes, 1),
-                            "timestamp": ts,
-                        })
-                        self._last_stale_notification_time = now
+            is_stale = elapsed_minutes >= stale_minutes_val
+
+        if self.notif_stale_enabled.get() and is_stale:
+            url = self.notif_stale_url.get().strip()
+            if url:
+                # Re-send at most once per stale_minutes interval
+                already_sent = (
+                    self._last_stale_notification_time is not None
+                    and (now - self._last_stale_notification_time).total_seconds() / 60.0 < stale_minutes_val
+                )
+                if not already_sent:
+                    self._send_webhook(url, {
+                        "event": "image_stale",
+                        "status": status,
+                        "stale_minutes": round(elapsed_minutes, 1),
+                        "timestamp": ts,
+                    })
+                    self._last_stale_notification_time = now
+
+        # Heartbeat notification — fires every heartbeat_minutes interval while monitoring is
+        # active, but is suppressed whenever the image is stale.
+        if self.notif_heartbeat_enabled.get() and not is_stale:
+            url = self.notif_heartbeat_url.get().strip()
+            if url:
+                try:
+                    heartbeat_minutes = float(self.notif_heartbeat_minutes.get())
+                except ValueError:
+                    heartbeat_minutes = 5.0
+                interval_elapsed = (
+                    self._last_heartbeat_time is None
+                    or (now - self._last_heartbeat_time).total_seconds() / 60.0 >= heartbeat_minutes
+                )
+                if interval_elapsed:
+                    self._send_webhook(url, {"event": "heartbeat", "status": status, "timestamp": ts})
+                    self._last_heartbeat_time = now
 
     def _update_hash_status_display(self):
         """Refresh the image hash status label. Returns True if the image is considered stale."""
@@ -1461,6 +1516,7 @@ class RoofClassifierApp:
         # Reset notification state so transition and stale notifications work correctly
         self.previous_status = None
         self._last_stale_notification_time = None
+        self._last_heartbeat_time = None
         self.last_image_hash = None
         self.last_new_hash_time = None
         self.status_label.config(text="Monitoring: Starting...", fg="blue")
