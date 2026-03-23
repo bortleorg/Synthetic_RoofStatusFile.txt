@@ -1806,6 +1806,8 @@ class RoofClassifierApp:
             "history": [],
             "tk_img": None,   # keep PhotoImage alive
             "tmp_path": None, # last temp file to clean up
+            "open_btn": None,   # set after button creation; used by load_current for highlights
+            "closed_btn": None, # set after button creation; used by load_current for highlights
         }
 
         # ── Image display ─────────────────────────────────────────────────────
@@ -1818,6 +1820,10 @@ class RoofClassifierApp:
         # ── Info bar ──────────────────────────────────────────────────────────
         info_label = tk.Label(win, text="", font=("Arial", 10))
         info_label.pack(pady=(4, 0))
+
+        # ── Model prediction indicator ────────────────────────────────────────
+        pred_label = tk.Label(win, text="", font=("Arial", 10, "italic"), fg="gray")
+        pred_label.pack(pady=(0, 2))
 
         # ── Button bar ────────────────────────────────────────────────────────
         btn_frame = tk.Frame(win)
@@ -1840,6 +1846,10 @@ class RoofClassifierApp:
                                  font=("Arial", 16, "bold"))
                 state["tk_img"] = None
                 info_label.config(text="No more images to classify.")
+                pred_label.config(text="")
+                if state["open_btn"]:
+                    state["open_btn"].config(relief=tk.RAISED, bd=2)
+                    state["closed_btn"].config(relief=tk.RAISED, bd=2)
                 return
 
             img_name = state["images"][state["index"]]
@@ -1852,6 +1862,10 @@ class RoofClassifierApp:
                 img_label.config(image="", text=f"⚠ Could not load:\n{img_name}",
                                  fg="red", bg="black", font=("Arial", 11))
                 state["tk_img"] = None
+                pred_label.config(text="")
+                if state["open_btn"]:
+                    state["open_btn"].config(relief=tk.RAISED, bd=2)
+                    state["closed_btn"].config(relief=tk.RAISED, bd=2)
                 return
 
             max_w, max_h = _CLASSIFY_IMG_MAX_W, _CLASSIFY_IMG_MAX_H
@@ -1872,6 +1886,27 @@ class RoofClassifierApp:
                 img_label.config(image="", text=f"⚠ Display error:\n{img_name}",
                                  fg="red", bg="black", font=("Arial", 11))
                 state["tk_img"] = None
+
+            # ── Model prediction ─────────────────────────────────────────────
+            if state["open_btn"]:
+                state["open_btn"].config(relief=tk.RAISED, bd=2)
+                state["closed_btn"].config(relief=tk.RAISED, bd=2)
+            if self.model is not None:
+                try:
+                    arr = self.prep_image(img_path).flatten().reshape(1, -1)
+                    prediction = self.model.predict(arr)[0]
+                    if prediction == 1:
+                        pred_label.config(text="🤖 Model predicts: OPEN", fg="#228B22")
+                        if state["open_btn"]:
+                            state["open_btn"].config(relief=tk.SOLID, bd=3)
+                    else:
+                        pred_label.config(text="🤖 Model predicts: CLOSED", fg="#CC0000")
+                        if state["closed_btn"]:
+                            state["closed_btn"].config(relief=tk.SOLID, bd=3)
+                except Exception:
+                    pred_label.config(text="🤖 Model prediction unavailable", fg="gray")
+            else:
+                pred_label.config(text="(no model loaded — load one to see predictions)", fg="gray")
 
         def classify(label):
             if state["index"] >= len(state["images"]):
@@ -1914,10 +1949,16 @@ class RoofClassifierApp:
             self.update_training_stats()
             load_current()
 
-        tk.Button(btn_frame, text="✓  Open", bg="#90EE90", font=("Arial", 11, "bold"),
-                  command=lambda: classify("open"), width=10).pack(side=tk.LEFT, padx=6)
-        tk.Button(btn_frame, text="✗  Closed", bg="#FFB6C1", font=("Arial", 11, "bold"),
-                  command=lambda: classify("closed"), width=10).pack(side=tk.LEFT, padx=6)
+        open_btn = tk.Button(btn_frame, text="✓  Open", bg="#90EE90", font=("Arial", 11, "bold"),
+                             command=lambda: classify("open"), width=10)
+        open_btn.pack(side=tk.LEFT, padx=6)
+        closed_btn = tk.Button(btn_frame, text="✗  Closed", bg="#FFB6C1", font=("Arial", 11, "bold"),
+                               command=lambda: classify("closed"), width=10)
+        closed_btn.pack(side=tk.LEFT, padx=6)
+        # Store references so load_current can update button highlights
+        state["open_btn"] = open_btn
+        state["closed_btn"] = closed_btn
+
         tk.Button(btn_frame, text="?  Other", bg="#FFE08A", font=("Arial", 11, "bold"),
                   command=lambda: classify("other"), width=10).pack(side=tk.LEFT, padx=6)
         tk.Button(btn_frame, text="🗑  Discard", bg="#D3D3D3", font=("Arial", 11),
