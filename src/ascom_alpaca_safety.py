@@ -18,13 +18,16 @@ import uuid
 class AscomAlpacaSafetyMonitor:
     """ASCOM Alpaca Safety Monitor implementation"""
     
-    def __init__(self, port=11111, device_number=0, roof_classifier_app=None):
+    def __init__(self, port=11111, device_number=0, roof_classifier_app=None, unique_id=None):
         self.port = port
         self.device_number = device_number
         self.roof_classifier_app = roof_classifier_app
-        
+
         # Device properties
-        self.device_id = str(uuid.uuid4())
+        # Use the caller-supplied persistent UniqueID when provided so NINA can
+        # reconnect to the same device after a restart/reboot. Fall back to a
+        # random UUID only when no stable id was given (e.g. standalone test mode).
+        self.device_id = unique_id if unique_id else str(uuid.uuid4())
         self.device_name = "Synthetic Roof Safety Monitor"
         self.device_description = "Safety monitor based on roof image classification"
         self.device_version = "1.0.0"
