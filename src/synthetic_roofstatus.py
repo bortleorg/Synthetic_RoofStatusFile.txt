@@ -73,6 +73,21 @@ class RoofClassifierApp:
         self.ascom_enabled = tk.BooleanVar(value=False)
         self.ascom_port = tk.StringVar(value="11111")
         self.ascom_device_number = tk.StringVar(value="0")
+        # Stable UniqueID so NINA can reconnect to the same device after a reboot.
+        # Generated once and persisted; do NOT regenerate per launch.
+        self.ascom_unique_id = ""
+
+        # Auto-start options
+        self.auto_start_monitoring = tk.BooleanVar(value=False)
+        self.auto_start_ascom = tk.BooleanVar(value=False)
+
+        # Frame capture options
+        # Save the frame whenever the model's reported status toggles (OPEN<->CLOSED),
+        # so a mis-classified transition can be reviewed/labelled manually later.
+        self.save_on_toggle_enabled = tk.BooleanVar(value=False)
+        # Save the first frame of each episode where the model disagrees with the
+        # secondary roof status file.
+        self.save_on_disagreement_enabled = tk.BooleanVar(value=False)
 
         # Camera URL for remote image source
         self.camera_url = tk.StringVar(value="")
@@ -85,6 +100,10 @@ class RoofClassifierApp:
         self.previous_status = None
         self._last_stale_notification_time = None
         self._last_heartbeat_time = None
+
+        # State tracking for frame capture / disagreement detection
+        self.previous_classified_status = None  # last final status seen by the monitor loop
+        self._in_disagreement = False           # currently in a model/secondary disagreement episode
 
         # Notification settings
         self.notif_stale_enabled = tk.BooleanVar(value=False)
@@ -114,6 +133,8 @@ class RoofClassifierApp:
         self.setup_logging()
         self.setup_gui()
         self._try_load_model_from_settings()
+        # Defer auto-start until the main loop is running so the UI is visible first.
+        self.root.after(800, self._apply_auto_start)
 
     def load_settings(self):
         """Load settings from JSON file"""
@@ -139,6 +160,15 @@ class RoofClassifierApp:
                     self.ascom_enabled.set(settings.get('ascom_enabled', False))
                     self.ascom_port.set(settings.get('ascom_port', '11111'))
                     self.ascom_device_number.set(settings.get('ascom_device_number', '0'))
+                    self.ascom_unique_id = settings.get('ascom_unique_id', '')
+
+                    # Auto-start settings
+                    self.auto_start_monitoring.set(settings.get('auto_start_monitoring', False))
+                    self.auto_start_ascom.set(settings.get('auto_start_ascom', False))
+
+                    # Frame capture settings
+                    self.save_on_toggle_enabled.set(settings.get('save_on_toggle_enabled', False))
+                    self.save_on_disagreement_enabled.set(settings.get('save_on_disagreement_enabled', False))
 
                     # Training set management settings
                     self.training_data_folder.set(settings.get('training_data_folder', ''))
@@ -181,6 +211,11 @@ class RoofClassifierApp:
                 'ascom_enabled': self.ascom_enabled.get(),
                 'ascom_port': self.ascom_port.get(),
                 'ascom_device_number': self.ascom_device_number.get(),
+                'ascom_unique_id': self.ascom_unique_id,
+                'auto_start_monitoring': self.auto_start_monitoring.get(),
+                'auto_start_ascom': self.auto_start_ascom.get(),
+                'save_on_toggle_enabled': self.save_on_toggle_enabled.get(),
+                'save_on_disagreement_enabled': self.save_on_disagreement_enabled.get(),
                 'training_data_folder': self.training_data_folder.get(),
                 'sample_mode_enabled': self.sample_mode_enabled.get(),
                 'sample_rate': self.sample_rate.get(),
@@ -271,24 +306,51 @@ class RoofClassifierApp:
                 # Defer the messagebox until after the main loop starts so the UI is visible
                 self.root.after(500, lambda m=msg: messagebox.showerror("Model Load Error", m))
 
-    def start_ascom_server(self):
-        """Start the ASCOM Alpaca server"""
+    def _apply_auto_start(self):
+        """Honour the auto-start-on-launch options for ASCOM and monitoring."""
+        if self.auto_start_ascom.get() and FLASK_AVAILABLE and not self.ascom_server:
+            self.start_ascom_server(silent=True)
+            if self.ascom_server:
+                self.ascom_enabled.set(True)
+
+        if self.auto_start_monitoring.get() and not self.monitoring_active:
+            if self.model:
+                self.start_monitoring()
+            elif self.logger:
+                self.logger.warning("Auto-start monitoring skipped: no model loaded.")
+
+    def start_ascom_server(self, silent=False):
+        """Start the ASCOM Alpaca server.
+
+        When *silent* is True (used for auto-start on launch) the success/already-running
+        dialogs are suppressed; errors are still reported.
+        """
         if not FLASK_AVAILABLE:
-            messagebox.showerror("Error", "Flask is not installed. Please install flask and flask-cors to use ASCOM Alpaca functionality.")
+            if not silent:
+                messagebox.showerror("Error", "Flask is not installed. Please install flask and flask-cors to use ASCOM Alpaca functionality.")
             return
-            
+
         if self.ascom_server:
-            messagebox.showwarning("Warning", "ASCOM server is already running.")
+            if not silent:
+                messagebox.showwarning("Warning", "ASCOM server is already running.")
             return
             
         try:
             port = int(self.ascom_port.get())
             device_number = int(self.ascom_device_number.get())
-            
+
+            # Ensure a stable UniqueID exists and is persisted so NINA can reconnect
+            # to the same device across reboots/restarts.
+            if not self.ascom_unique_id:
+                import uuid
+                self.ascom_unique_id = str(uuid.uuid4())
+                self.save_settings()
+
             self.ascom_server = AscomAlpacaSafetyMonitor(
                 port=port,
                 device_number=device_number,
-                roof_classifier_app=self
+                roof_classifier_app=self,
+                unique_id=self.ascom_unique_id
             )
             
             # Start server in a separate thread
@@ -300,18 +362,23 @@ class RoofClassifierApp:
             
             if self.logger:
                 self.logger.info(f"ASCOM Alpaca server started on port {port}")
-            
-            messagebox.showinfo("ASCOM Server Started", 
-                f"ASCOM Alpaca Safety Monitor started on port {port}\n"
-                f"Device number: {device_number}\n"
-                f"Management API: http://localhost:{port}/management/apiversions\n"
-                f"Configure NINA to connect to: localhost:{port}")
-                
+
+            if not silent:
+                messagebox.showinfo("ASCOM Server Started",
+                    f"ASCOM Alpaca Safety Monitor started on port {port}\n"
+                    f"Device number: {device_number}\n"
+                    f"Management API: http://localhost:{port}/management/apiversions\n"
+                    f"Configure NINA to connect to: localhost:{port}")
+
         except ValueError:
-            messagebox.showerror("Error", "Please enter valid numeric values for port and device number.")
+            if not silent:
+                messagebox.showerror("Error", "Please enter valid numeric values for port and device number.")
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to start ASCOM server: {str(e)}")
-            
+            if not silent:
+                messagebox.showerror("Error", f"Failed to start ASCOM server: {str(e)}")
+            elif self.logger:
+                self.logger.error(f"Failed to auto-start ASCOM server: {e}")
+
     def stop_ascom_server(self):
         """Stop the ASCOM Alpaca server"""
         if self.ascom_server:
@@ -529,6 +596,14 @@ class RoofClassifierApp:
         tk.Label(sample_rate_frame, text="Sample rate (0–1):").pack(side=tk.LEFT, padx=(5, 2))
         tk.Entry(sample_rate_frame, textvariable=self.sample_rate, width=5).pack(side=tk.LEFT)
 
+        # Targeted frame capture while monitoring (saved to the unclassified folder)
+        tk.Checkbutton(train_frame,
+                       text="Save frame when reported status toggles (OPEN↔CLOSED)",
+                       variable=self.save_on_toggle_enabled, command=self.save_settings).pack(anchor="w")
+        tk.Checkbutton(train_frame,
+                       text="Save first frame when model disagrees with secondary roof file",
+                       variable=self.save_on_disagreement_enabled, command=self.save_settings).pack(anchor="w")
+
         # Stats display
         self.stats_label = tk.Label(train_frame, text="Training set: Open: 0, Closed: 0", fg="blue")
         self.stats_label.pack(pady=5)
@@ -604,6 +679,9 @@ class RoofClassifierApp:
         tk.Entry(camera_url_inner, textvariable=self.camera_url, width=40).pack(side=tk.LEFT, fill="x", expand=True)
         tk.Button(camera_url_inner, text="Test", command=self._test_camera_url).pack(side=tk.RIGHT, padx=(5, 0))
 
+        tk.Checkbutton(monitor_frame, text="Auto-start monitoring on launch",
+                       variable=self.auto_start_monitoring, command=self.save_settings).pack(anchor="w", pady=(2, 0))
+
         button_frame = tk.Frame(monitor_frame)
         button_frame.pack(pady=5)
         tk.Button(button_frame, text="Start Monitoring", command=self.start_monitoring).pack(side=tk.LEFT, padx=5)
@@ -619,6 +697,9 @@ class RoofClassifierApp:
         self.hash_status_label = tk.Label(status_frame, text="Image hash: Not monitoring", fg="gray",
                                           font=("Arial", 8))
         self.hash_status_label.pack()
+        self.sun_status_label = tk.Label(status_frame, text="Sun altitude: --", fg="gray",
+                                         font=("Arial", 9))
+        self.sun_status_label.pack()
 
         # ── Tab 3: Configuration ──────────────────────────────────────────────
         tab_config = ttk.Frame(notebook)
@@ -708,6 +789,9 @@ class RoofClassifierApp:
             ascom_checkbox = tk.Checkbutton(ascom_enable_frame, text="Enable ASCOM Alpaca Safety Monitor",
                                           variable=self.ascom_enabled, command=self.on_ascom_enabled_changed)
             ascom_checkbox.pack(side=tk.LEFT)
+
+            tk.Checkbutton(ascom_frame, text="Auto-start ASCOM server on launch",
+                           variable=self.auto_start_ascom, command=self.save_settings).pack(anchor="w", pady=(2, 0))
 
             # Port and device number configuration
             ascom_config_frame = tk.Frame(ascom_frame)
@@ -1170,7 +1254,33 @@ class RoofClassifierApp:
         
         if self.logger:
             self.logger.info(log_message)
-        
+
+        # ── Model vs secondary roof file comparison ───────────────────────────
+        # Compare the raw model estimate (image_status) against the secondary roof
+        # status file. Log loudly on mismatch and optionally capture the first frame
+        # of each disagreement episode for manual review.
+        if secondary_status:
+            if image_status != secondary_status:
+                if self.logger:
+                    self.logger.warning(
+                        f"MODEL/SECONDARY MISMATCH: model={image_status} (final={final_status}) "
+                        f"!= secondary={secondary_status} (updated: {secondary_time}) for image {latest}"
+                    )
+                if self.save_on_disagreement_enabled.get() and not self._in_disagreement:
+                    self._save_frame_for_review(img_path, "disagree")
+                self._in_disagreement = True
+            else:
+                self._in_disagreement = False
+
+        # ── State toggle capture ──────────────────────────────────────────────
+        # When the reported status flips, save the frame so a wrongly-classified
+        # transition can be reviewed/labelled later.
+        if (self.save_on_toggle_enabled.get()
+                and self.previous_classified_status is not None
+                and final_status != self.previous_classified_status):
+            self._save_frame_for_review(img_path, "toggle")
+        self.previous_classified_status = final_status
+
         # Write to output file (overwrite with current status as a single line)
         # Format follows the SRO Roof File spec: https://interactiveastronomy.com/skyroof_help/SROrooffile.html
         line = f"???{now} Roof Status: {final_status}{override_reason}\n"
@@ -1204,6 +1314,7 @@ class RoofClassifierApp:
 
             # Update hash/stale display and check for stale warning
             stale_warning = self._update_hash_status_display()
+            self._update_sun_status_display()
 
             if stale_warning:
                 self.statusbar_label.config(
@@ -1237,6 +1348,8 @@ class RoofClassifierApp:
         self.statusbar_toggle_btn.config(text="Start Monitoring")
         if hasattr(self, 'hash_status_label'):
             self.hash_status_label.config(text="Image hash: Not monitoring", fg="gray")
+        if hasattr(self, 'sun_status_label'):
+            self.sun_status_label.config(text="Sun altitude: --", fg="gray")
 
     # ── New feature helpers ───────────────────────────────────────────────────
 
@@ -1394,6 +1507,29 @@ class RoofClassifierApp:
             )
         return is_stale
 
+    def _update_sun_status_display(self):
+        """Refresh the Monitoring-tab sun altitude label, flagging when the sun is
+        above the configured safe threshold (i.e. unsafe to report OPEN)."""
+        if not hasattr(self, "sun_status_label"):
+            return
+        try:
+            sun_angle = self.calculate_sun_angle()
+            threshold = float(self.sun_angle_threshold.get())
+        except Exception:
+            self.sun_status_label.config(text="Sun altitude: error", fg="gray")
+            return
+
+        if sun_angle < threshold:
+            self.sun_status_label.config(
+                text=f"Sun altitude: {sun_angle:.1f}° (safe — below {threshold:.1f}° threshold)",
+                fg="darkgreen",
+            )
+        else:
+            self.sun_status_label.config(
+                text=f"⚠ Sun altitude: {sun_angle:.1f}° (UNSAFE — above {threshold:.1f}° threshold)",
+                fg="darkorange",
+            )
+
     def _test_camera_url(self):
         """Test downloading an image from the configured camera URL."""
         url = self.camera_url.get().strip()
@@ -1519,10 +1655,13 @@ class RoofClassifierApp:
         self._last_heartbeat_time = None
         self.last_image_hash = None
         self.last_new_hash_time = None
+        self.previous_classified_status = None
+        self._in_disagreement = False
         self.status_label.config(text="Monitoring: Starting...", fg="blue")
         self.countdown_label.config(text="")
         self.statusbar_label.config(text="● Monitoring: Active", fg="green")
         self.statusbar_toggle_btn.config(text="Stop Monitoring")
+        self._update_sun_status_display()
         
         if self.logger:
             self.logger.info("Monitoring started")
@@ -1796,6 +1935,30 @@ class RoofClassifierApp:
         horizontal_scrollbar.grid(row=1, column=0, sticky="ew")
         detail_frame.rowconfigure(0, weight=1)
         detail_frame.columnconfigure(0, weight=1)
+
+    def _save_frame_for_review(self, img_path, reason):
+        """Copy *img_path* into the unclassified folder so it can be labelled later.
+
+        *reason* is a short tag (e.g. 'toggle', 'disagree') prepended to the filename
+        so the cause of capture is visible in the Classify Images window.
+        """
+        try:
+            unclassified_folder = self._get_training_class_folder("unclassified")
+            os.makedirs(unclassified_folder, exist_ok=True)
+            stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            dest = os.path.join(unclassified_folder, f"{reason}_{stamp}_{os.path.basename(img_path)}")
+            base, ext = os.path.splitext(dest)
+            counter = 1
+            while os.path.exists(dest):
+                dest = f"{base}_{counter}{ext}"
+                counter += 1
+            shutil.copy2(img_path, dest)
+            if self.logger:
+                self.logger.info(f"Saved frame for review ({reason}): {dest}")
+            self.root.after(0, self.update_training_stats)
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"Error saving frame for review ({reason}): {e}")
 
     def save_sample_if_needed(self, img_path):
         """Randomly copy an image to the unclassified folder when sampling mode is active."""
