@@ -11,6 +11,7 @@
 - Every 60 seconds, it checks for the newest image and classifies it as `OPEN` or `CLOSED`.
 - The result is written to the output `.txt` file as a single line.
 - The app tracks a hash of each image so it can detect stale (unchanged) images and alert you via the UI or webhooks.
+- A manual override can force the reported status to `OPEN` or `CLOSED` for a chosen period when you need to overrule the model.
 
 The file format looks like this:
 
@@ -47,6 +48,31 @@ When classifying images, if a model is loaded it automatically runs inference on
 
 The Monitoring tab also shows **"Image last changed: X min ago"** — the elapsed time since the image hash last changed. This turns orange when the image has not changed for longer than the stale threshold (configured in the Notifications tab). The status bar additionally shows a `⚠ stale image` warning in orange when the image is stale.
 
+#### Latest All-Sky Image preview
+
+The Monitoring tab shows a scaled-down preview of the most recent frame, so you can see what the classifier is actually looking at without opening the image folder. It updates on every monitoring cycle, and the caption shows the source file name (or camera URL) and the time it was displayed.
+
+- **"Refresh"** fetches and displays the latest image on demand, whether or not monitoring is running.
+- **"Show preview"** collapses the panel. While hidden, no preview images are generated at all, which is useful on small screens or low-powered machines.
+
+#### Manual Override
+
+The **Manual Override** panel forces the reported roof status regardless of what the model sees. This is for the cases where you know better than the classifier — for example while the camera is obscured, during maintenance, or when you want to hard-close the observatory to automation.
+
+1. Choose **Auto (use model)**, **Force OPEN**, or **Force CLOSED**.
+2. Choose a **Duration**: `1 hour`, `4 hours`, `Until noon`, `Until midnight`, or `Forever` (until you clear it).
+3. Click **"Apply Override"**. The panel shows the active override and a live countdown; **"Clear Override"** returns to model output immediately.
+
+While an override is active:
+
+- The output status file reports the forced status, annotated as `(Manual override: OPEN|CLOSED)`. It is written the moment you click **"Apply Override"**, not on the next monitoring cycle, so the file is correct even when monitoring is stopped.
+- ASCOM clients see the forced status.
+- Clearing an override immediately re-classifies the latest image and rewrites the status file, so the forced line never lingers. (If no model is loaded there is nothing to re-classify, and a warning is logged instead.)
+- The override is written to the settings file, so it survives an app restart. An override whose expiry passed while the app was closed is discarded on the next launch, as is one whose stored expiry is unreadable — a corrupt settings file will never silently turn a timed override into a permanent one.
+- Every applied, expired, and cleared override is logged at `WARNING` level.
+
+> **Safety note:** the sun angle guard is still applied to the ASCOM `IsSafe` flag. A forced `OPEN` is written to the status file, but ASCOM clients will not be told it is safe while the sun is above the configured threshold. To defeat the sun guard as well, change the Sun Angle Threshold in the Configuration tab.
+
 ### Configuration
 
 **Logging** — Enable file logging and choose a log file path. The log records each classification decision, sun angle, and secondary source status.
@@ -62,7 +88,9 @@ The Monitoring tab also shows **"Image last changed: X min ago"** — the elapse
 
 The calculated observation window (next sunset and sunrise in UTC) is displayed and updated automatically.
 
-**Secondary Roof Status File** — Enable this option and point it at another `RoofStatusFile.txt`-format file to cross-reference a second source. The secondary status is shown in the monitoring display and logged alongside each primary classification, but it does not override the primary decision.
+**Secondary Roof Status File or URL** — Enable this option and point it at a second roof status source to cross-reference. It accepts either a local file path (use **"Browse..."**) or an `http://` / `https://` URL — useful when the authoritative roof file lives on another machine that serves it over HTTP. The last non-empty line must contain `OPEN` or `CLOSED`. Use **"Test"** to confirm the source can be read and see the status it currently reports.
+
+The secondary status is shown in the monitoring display and logged alongside each primary classification, but it does not override the primary decision. For URL sources, the last-update time comes from the server's `Last-Modified` header when present, otherwise the time of the fetch, and results are cached for 30 seconds so UI refreshes do not issue a request per redraw.
 
 **ASCOM Alpaca Safety Monitor** — The app can serve an ASCOM Alpaca-compatible Safety Monitor API on a configurable port (default 11111). Enable it here and configure the port and device number. N.I.N.A. and other ASCOM clients can auto-discover the device via UDP port 32227 or connect manually. Use **"Test Discovery"** to verify the network setup, and **"Open Setup Page"** to view the Alpaca setup endpoint in a browser.
 
