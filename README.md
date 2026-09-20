@@ -88,7 +88,7 @@ While an override is active:
 
 The calculated observation window (next sunset and sunrise in UTC) is displayed and updated automatically.
 
-**Secondary Roof Status File or URL** — Enable this option and point it at a second roof status source to cross-reference. It accepts either a local file path (use **"Browse..."**) or an `http://` / `https://` URL — useful when the authoritative roof file lives on another machine that serves it over HTTP. The last non-empty line must contain `OPEN` or `CLOSED`. Use **"Test"** to confirm the source can be read and see the status it currently reports.
+**Secondary Roof Status File or URL** — Enable this option and point it at a second roof status source to cross-reference. It accepts either a local file path (use **"Browse..."**) or an `http://` / `https://` URL — useful when the authoritative roof file lives on another machine that serves it over HTTP. The last non-empty line must contain `OPEN` or `CLOSED` as a word; a negated or ambiguous line is treated as unreadable rather than guessed at. Use **"Test"** to confirm the source can be read and see the status it currently reports.
 
 The secondary status is shown in the monitoring display and logged alongside each primary classification, but it does not override the primary decision. For URL sources, the last-update time comes from the server's `Last-Modified` header when present, otherwise the time of the fetch, and results are cached for 30 seconds so UI refreshes do not issue a request per redraw.
 
@@ -148,6 +148,19 @@ pyinstaller synthetic_roofstatus.spec
 
 The built executable will be in the `dist/` folder.
 
+### Running the Tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest
+```
+
+The suite covers the parts that run unattended overnight: the roof status file
+writer, settings persistence, the secondary-source parser, the sun-angle safety
+guard, classification caching/locking, and the ASCOM safety and discovery logic.
+It needs no display and no camera. CI runs it on every push and pull request,
+and the executable is only built if it passes.
+
 ## System Requirements
 
 - Windows 10 or later
@@ -159,4 +172,6 @@ The built executable will be in the `dist/` folder.
 - This is not a deep learning system. It uses classical ML for speed and simplicity.
 - Images should be reasonably consistent in angle and framing.
 - Works best when lighting or exposure is fairly stable across captures.
-- Settings (model path, folder paths, location, thresholds, etc.) are saved automatically to `roof_classifier_settings.json` in the working directory and restored on the next launch.
+- Settings (model path, folder paths, location, thresholds, etc.) are saved automatically to `roof_classifier_settings.json` in the working directory and restored on the next launch. Both this file and the roof status file are written atomically, so a crash or a reader polling the file cannot leave either one half-written. A settings file that is unreadable anyway is moved aside to `roof_classifier_settings.json.corrupt` and defaults are used.
+- Safety decisions fail closed. If the sun altitude cannot be calculated, or the last roof classification is more than three minutes old, the ASCOM `IsSafe` flag reports unsafe rather than assuming the best.
+- A secondary roof status file is parsed on whole words. A line such as `roof is not open` is treated as unreadable rather than as `OPEN`, and a line mentioning both states is read as `CLOSED`.

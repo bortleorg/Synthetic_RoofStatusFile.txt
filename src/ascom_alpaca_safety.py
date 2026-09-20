@@ -5,20 +5,46 @@ Provides a REST API compatible with ASCOM Alpaca for safety monitoring
 
 import json
 import threading
-import time
 import socket
-import struct
 from datetime import datetime, timezone
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import logging
-import os
 import uuid
+
+# Seconds between safety-status refreshes.
+UPDATE_INTERVAL_SECONDS = 30
+
+# A roof classification older than this is not trusted for the IsSafe flag.
+MAX_STATUS_AGE_SECONDS = 180
+
+
+def compute_safety(status, sun_safe, age_seconds, max_age_seconds=MAX_STATUS_AGE_SECONDS):
+    """Decide the ASCOM IsSafe flag from the latest roof classification.
+
+    Returns ``(is_safe, error_message)``. Conditions are reported safe only when
+    the roof is known to be OPEN, that knowledge is recent, and the sun is below
+    the configured threshold. Every unknown resolves to unsafe: an ASCOM client
+    acts on this flag, so a missing or stale answer must never read as "safe".
+    """
+    if status is None:
+        if age_seconds is None:
+            return False, "No roof status available yet"
+        return False, f"Roof status is stale ({age_seconds:.0f}s old)"
+    if age_seconds is not None and age_seconds > max_age_seconds:
+        return False, f"Roof status is stale ({age_seconds:.0f}s old)"
+    if status != "OPEN":
+        return False, ""
+    if not sun_safe:
+        return False, ""
+    return True, ""
+
 
 class AscomAlpacaSafetyMonitor:
     """ASCOM Alpaca Safety Monitor implementation"""
-    
-    def __init__(self, port=11111, device_number=0, roof_classifier_app=None, unique_id=None):
+
+    def __init__(self, port=11111, device_number=0, roof_classifier_app=None, unique_id=None,
+                 start_background=True):
         self.port = port
         self.device_number = device_number
         self.roof_classifier_app = roof_classifier_app
@@ -33,11 +59,13 @@ class AscomAlpacaSafetyMonitor:
         self.device_version = "1.0.0"
         self.driver_version = "1.0.0"
         
-        # Safety monitor state
+        # Safety monitor state. IsSafe starts False: a client that connects and
+        # polls before the first classification must not be told conditions are
+        # safe on the strength of a default value.
         self.connected = False
-        self.is_safe = True
+        self.is_safe = False
         self.last_update = datetime.now(timezone.utc)
-        self.last_error = ""
+        self.last_error = "No roof status available yet"
         
         # Discovery settings
         self.discovery_enabled = True
@@ -53,20 +81,32 @@ class AscomAlpacaSafetyMonitor:
         
         # Setup routes
         self.setup_routes()
-        
-        # Start discovery responder
-        if self.discovery_enabled:
-            self.start_discovery_responder()
-        
-        # Start update thread
-        self.update_thread = threading.Thread(target=self.update_safety_status, daemon=True)
-        self.update_thread.start()
+
+        # Signals both background threads to exit; also lets tests construct the
+        # server without starting anything.
+        self._stop_event = threading.Event()
+        # ServerTransactionID must be unique per response, and Flask serves
+        # requests from several threads.
+        self._transaction_lock = threading.Lock()
+        self._server_transaction_id = 0
+        self.update_thread = None
+
+        if start_background:
+            if self.discovery_enabled:
+                self.start_discovery_responder()
+            self.update_thread = threading.Thread(target=self.update_safety_status, daemon=True)
+            self.update_thread.start()
         
     def setup_logging(self):
         """Setup logging for the ASCOM server"""
         self.logger = logging.getLogger('AscomAlpacaSafetyMonitor')
         self.logger.setLevel(logging.DEBUG)  # Set to DEBUG for troubleshooting
-        
+
+        # The logger is module-global, so a second server instance would otherwise
+        # attach a second set of handlers and double every log line.
+        if self.logger.handlers:
+            return
+
         # Create formatter
         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         
@@ -102,7 +142,7 @@ class AscomAlpacaSafetyMonitor:
             
     def discovery_responder(self):
         """Handle ASCOM discovery requests"""
-        while self.discovery_socket:
+        while self.discovery_socket and not self._stop_event.is_set():
             try:
                 data, addr = self.discovery_socket.recvfrom(1024)
                 
@@ -125,10 +165,18 @@ class AscomAlpacaSafetyMonitor:
                     
                     self.logger.debug(f"Discovery response sent to {addr}")
                     
-            except Exception as e:
-                if self.discovery_socket:  # Only log if we're still supposed to be running
-                    self.logger.error(f"Error in discovery responder: {e}")
+            except OSError as e:
+                # The socket was closed (stop requested), or the OS handed us an
+                # unrecoverable error - either way there is nothing left to serve.
+                if self.discovery_socket and not self._stop_event.is_set():
+                    self.logger.error(f"Discovery socket error, responder stopping: {e}")
                 break
+            except Exception as e:
+                # A malformed packet or a serialisation failure must not take the
+                # responder down for the rest of the session: NINA would then never
+                # find the device again without a restart.
+                self.logger.error(f"Error handling discovery request, continuing: {e}")
+                continue
                 
     def stop_discovery_responder(self):
         """Stop the discovery responder"""
@@ -191,11 +239,10 @@ class AscomAlpacaSafetyMonitor:
         if client_transaction_id is not None:
             response['ClientTransactionID'] = client_transaction_id
         
-        # Add server transaction ID (incremental)
-        if not hasattr(self, '_server_transaction_id'):
-            self._server_transaction_id = 0
-        self._server_transaction_id += 1
-        response['ServerTransactionID'] = self._server_transaction_id
+        # Add server transaction ID (incremental, unique across worker threads)
+        with self._transaction_lock:
+            self._server_transaction_id += 1
+            response['ServerTransactionID'] = self._server_transaction_id
         
         return jsonify(response)
     
@@ -329,6 +376,9 @@ class AscomAlpacaSafetyMonitor:
                         self.connected = connected_value
                         if self.connected:
                             self.logger.info("ASCOM client connected")
+                            # Refresh now rather than leaving the client to read a
+                            # flag that is up to one update interval out of date.
+                            self.refresh_safety_status()
                         else:
                             self.logger.info("ASCOM client disconnected")
                     else:
@@ -442,16 +492,19 @@ class AscomAlpacaSafetyMonitor:
             """Return detailed status information"""
             roof_status = "UNKNOWN"
             sun_angle = "N/A"
-            
+
             if self.roof_classifier_app:
                 try:
-                    # Get current roof status
-                    filename, status = self.roof_classifier_app.classify_latest_png()
+                    # Report the most recent classification rather than starting a
+                    # new one: this endpoint is a read, and classifying here would
+                    # rewrite the roof status file on an arbitrary HTTP request.
+                    status, _age = self.roof_classifier_app.get_cached_status()
                     if status:
                         roof_status = status
-                    
-                    # Get sun angle
-                    sun_angle = f"{self.roof_classifier_app.calculate_sun_angle():.1f}°"
+
+                    angle = self.roof_classifier_app.calculate_sun_angle()
+                    if angle is not None:
+                        sun_angle = f"{angle:.1f}°"
                 except Exception as e:
                     self.logger.warning(f"Error getting roof status: {e}")
             
@@ -478,42 +531,46 @@ class AscomAlpacaSafetyMonitor:
                 self.logger.warning(f"Unknown endpoint: {request.method} /{path}")
             return self.get_ascom_response(None, 1, f"Unknown endpoint: /{path}")
             
+    def refresh_safety_status(self):
+        """Recompute IsSafe once from the classifier's latest result."""
+        try:
+            if not self.roof_classifier_app:
+                # Standalone/test mode: nothing to base a judgement on.
+                self.is_safe = True
+                return
+
+            if not self.connected:
+                # No client is listening; leave the flag alone rather than
+                # publishing an optimistic value a client might pick up on connect.
+                return
+
+            # Ask for the classification the monitor loop already produced. This
+            # thread used to run its own classify_latest_png(), which raced the
+            # monitor thread for the roof status file and the shared toggle and
+            # disagreement state.
+            status, age = self.roof_classifier_app.get_cached_status(MAX_STATUS_AGE_SECONDS)
+            sun_safe = self.roof_classifier_app.is_sun_safe_for_open()
+
+            self.is_safe, self.last_error = compute_safety(
+                status, sun_safe, age, MAX_STATUS_AGE_SECONDS)
+            self.last_update = datetime.now(timezone.utc)
+
+            if self.last_error:
+                self.logger.warning(f"Reporting unsafe: {self.last_error}")
+            else:
+                self.logger.debug(
+                    f"Safety status updated: Safe={self.is_safe}, Roof={status}, Sun safe={sun_safe}")
+
+        except Exception as e:
+            self.is_safe = False
+            self.last_error = f"Error updating safety status: {str(e)}"
+            self.logger.error(f"Error updating safety status: {e}")
+
     def update_safety_status(self):
         """Background thread to update safety status"""
-        while True:
-            try:
-                if self.roof_classifier_app and self.connected:
-                    # Get current roof status
-                    filename, status = self.roof_classifier_app.classify_latest_png()
-                    
-                    if status:
-                        # Safety logic: safe if roof is OPEN and sun conditions are safe
-                        roof_open = (status == "OPEN")
-                        sun_safe = self.roof_classifier_app.is_sun_safe_for_open()
-                        
-                        # Safe only if both conditions are met
-                        self.is_safe = roof_open and sun_safe
-                        
-                        self.last_update = datetime.now(timezone.utc)
-                        self.last_error = ""
-                        
-                        self.logger.debug(f"Safety status updated: Safe={self.is_safe}, Roof={status}, Sun safe={sun_safe}")
-                        
-                    else:
-                        self.is_safe = False
-                        self.last_error = "Unable to determine roof status"
-                        self.logger.warning("Could not determine roof status")
-                        
-                else:
-                    # If not connected or no roof classifier, default to safe
-                    self.is_safe = True
-                    
-            except Exception as e:
-                self.is_safe = False
-                self.last_error = f"Error updating safety status: {str(e)}"
-                self.logger.error(f"Error updating safety status: {e}")
-                
-            time.sleep(30)  # Update every 30 seconds
+        while not self._stop_event.is_set():
+            self.refresh_safety_status()
+            self._stop_event.wait(UPDATE_INTERVAL_SECONDS)
             
     def run(self):
         """Start the ASCOM Alpaca server"""
@@ -531,7 +588,10 @@ class AscomAlpacaSafetyMonitor:
     def stop(self):
         """Stop the ASCOM Alpaca server"""
         self.logger.info("Stopping ASCOM Alpaca Safety Monitor")
-        
+
+        # Signal the update thread and the discovery responder to exit
+        self._stop_event.set()
+
         # Stop discovery responder
         self.stop_discovery_responder()
         

@@ -8,7 +8,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import logging
@@ -19,6 +19,13 @@ import random
 import tempfile
 import ephem
 import pytz
+from roof_io import (
+    atomic_write_text,
+    format_status_line,
+    load_json_with_recovery,
+    parse_roof_status,
+    write_json_atomic,
+)
 try:
     from astropy.io import fits
     FITS_AVAILABLE = True
@@ -47,6 +54,15 @@ _PREVIEW_IMG_MAX_H = 260   # max height of the latest-image preview on the Monit
 
 # Manual override duration choices shown in the Monitoring tab dropdown
 OVERRIDE_DURATIONS = ["1 hour", "4 hours", "Until noon", "Until midnight", "Forever"]
+
+# A cached classification newer than this is reused instead of running the whole
+# capture/classify pipeline again. The monitor loop runs every 60s, so an ASCOM
+# poll in between is served from the cache.
+CLASSIFICATION_CACHE_SECONDS = 30
+
+# A cached classification older than this is treated as unavailable: the ASCOM
+# safety monitor must not keep reporting a stale roof state as authoritative.
+CLASSIFICATION_MAX_AGE_SECONDS = 180
 
 # How long a secondary roof status fetched over HTTP is reused before re-fetching.
 # Keeps the UI thread from issuing a network request on every status-label refresh.
@@ -122,6 +138,13 @@ class RoofClassifierApp:
         # Last configuration snapshot handed to a worker thread (see _get_monitor_config)
         self._last_monitor_config = None
 
+        # Classification is shared mutable state (image hash, toggle baseline,
+        # disagreement episode, preview, the status file itself), and both the
+        # monitor thread and the ASCOM server thread ask for it. Serialise it, and
+        # cache the result so the second caller reuses the first one's work.
+        self._classify_lock = threading.RLock()
+        self._last_classification = None  # (filename, status, datetime UTC) or None
+
         # Image hash tracking state
         self.last_image_hash = None
         self.last_new_hash_time = None  # datetime (UTC) when hash last changed
@@ -168,87 +191,91 @@ class RoofClassifierApp:
 
     def load_settings(self):
         """Load settings from JSON file"""
+        def _report_corrupt(backup, exc):
+            where = f" It was moved aside to {backup}." if backup else ""
+            print(f"Settings file {SETTINGS_FILE} is corrupt ({exc}); "
+                  f"falling back to defaults.{where}")
+
         try:
-            if os.path.exists(SETTINGS_FILE):
-                with open(SETTINGS_FILE, 'r') as f:
-                    settings = json.load(f)
-                    self.model_path.set(settings.get('model_path', ''))
-                    self.monitor_path.set(settings.get('monitor_path', ''))
-                    self.output_path.set(settings.get('output_path', 'RoofStatusFile.txt'))
-                    
-                    # Load new settings
-                    self.log_enabled.set(settings.get('log_enabled', False))
-                    self.log_path.set(settings.get('log_path', 'roof_classifier.log'))
-                    self.latitude.set(settings.get('latitude', '40.0'))
-                    self.longitude.set(settings.get('longitude', '-74.0'))
-                    self.sun_angle_threshold.set(settings.get('sun_angle_threshold', '-17.0'))
-                    self.secondary_source_enabled.set(settings.get('secondary_source_enabled', False))
-                    self.secondary_source_path.set(settings.get('secondary_source_path', ''))
-                    self.twilight_preset_var.set(settings.get('twilight_preset', 'Custom'))
-                    
-                    # ASCOM Alpaca settings
-                    self.ascom_enabled.set(settings.get('ascom_enabled', False))
-                    self.ascom_port.set(settings.get('ascom_port', '11111'))
-                    self.ascom_device_number.set(settings.get('ascom_device_number', '0'))
-                    self.ascom_unique_id = settings.get('ascom_unique_id', '')
+            settings = load_json_with_recovery(SETTINGS_FILE, on_corrupt=_report_corrupt)
+            if settings is not None:
+                self.model_path.set(settings.get('model_path', ''))
+                self.monitor_path.set(settings.get('monitor_path', ''))
+                self.output_path.set(settings.get('output_path', 'RoofStatusFile.txt'))
 
-                    # Auto-start settings
-                    self.auto_start_monitoring.set(settings.get('auto_start_monitoring', False))
-                    self.auto_start_ascom.set(settings.get('auto_start_ascom', False))
+                # Load new settings
+                self.log_enabled.set(settings.get('log_enabled', False))
+                self.log_path.set(settings.get('log_path', 'roof_classifier.log'))
+                self.latitude.set(settings.get('latitude', '40.0'))
+                self.longitude.set(settings.get('longitude', '-74.0'))
+                self.sun_angle_threshold.set(settings.get('sun_angle_threshold', '-17.0'))
+                self.secondary_source_enabled.set(settings.get('secondary_source_enabled', False))
+                self.secondary_source_path.set(settings.get('secondary_source_path', ''))
+                self.twilight_preset_var.set(settings.get('twilight_preset', 'Custom'))
 
-                    # Frame capture settings
-                    self.save_on_toggle_enabled.set(settings.get('save_on_toggle_enabled', False))
-                    self.save_on_disagreement_enabled.set(settings.get('save_on_disagreement_enabled', False))
+                # ASCOM Alpaca settings
+                self.ascom_enabled.set(settings.get('ascom_enabled', False))
+                self.ascom_port.set(settings.get('ascom_port', '11111'))
+                self.ascom_device_number.set(settings.get('ascom_device_number', '0'))
+                self.ascom_unique_id = settings.get('ascom_unique_id', '')
 
-                    # Training set management settings
-                    self.training_data_folder.set(settings.get('training_data_folder', ''))
-                    self.sample_mode_enabled.set(settings.get('sample_mode_enabled', False))
-                    self.sample_rate.set(settings.get('sample_rate', '0.1'))
-                    self.validation_set_path.set(settings.get('validation_set_path', ''))
+                # Auto-start settings
+                self.auto_start_monitoring.set(settings.get('auto_start_monitoring', False))
+                self.auto_start_ascom.set(settings.get('auto_start_ascom', False))
 
-                    # Camera URL
-                    self.camera_url.set(settings.get('camera_url', ''))
+                # Frame capture settings
+                self.save_on_toggle_enabled.set(settings.get('save_on_toggle_enabled', False))
+                self.save_on_disagreement_enabled.set(settings.get('save_on_disagreement_enabled', False))
 
-                    # Latest-image preview
-                    self.preview_enabled.set(settings.get('preview_enabled', True))
-                    self._preview_on = self.preview_enabled.get()
+                # Training set management settings
+                self.training_data_folder.set(settings.get('training_data_folder', ''))
+                self.sample_mode_enabled.set(settings.get('sample_mode_enabled', False))
+                self.sample_rate.set(settings.get('sample_rate', '0.1'))
+                self.validation_set_path.set(settings.get('validation_set_path', ''))
 
-                    # Manual override — restored so an override survives a restart
-                    self.override_duration.set(settings.get('override_duration', '1 hour'))
-                    saved_override = settings.get('override_active') or None
-                    saved_expiry = settings.get('override_expiry') or None
-                    if saved_override in ("OPEN", "CLOSED"):
+                # Camera URL
+                self.camera_url.set(settings.get('camera_url', ''))
+
+                # Latest-image preview
+                self.preview_enabled.set(settings.get('preview_enabled', True))
+                self._preview_on = self.preview_enabled.get()
+
+                # Manual override — restored so an override survives a restart
+                self.override_duration.set(settings.get('override_duration', '1 hour'))
+                saved_override = settings.get('override_active') or None
+                saved_expiry = settings.get('override_expiry') or None
+                if saved_override in ("OPEN", "CLOSED"):
+                    expiry = None
+                    expiry_invalid = False
+                    if saved_expiry:
+                        try:
+                            expiry = datetime.fromisoformat(saved_expiry)
+                        except (ValueError, TypeError):
+                            expiry_invalid = True
+                    if expiry_invalid:
+                        # A time-limited override with an unreadable expiry must never
+                        # be promoted to an indefinite one — discard it instead.
+                        print(f"Discarding manual override with invalid expiry: {saved_expiry!r}")
+                        saved_override = None
+                    elif expiry is not None and expiry <= datetime.now():
+                        # Drop an override that expired while the app was closed
+                        saved_override = None
                         expiry = None
-                        expiry_invalid = False
-                        if saved_expiry:
-                            try:
-                                expiry = datetime.fromisoformat(saved_expiry)
-                            except (ValueError, TypeError):
-                                expiry_invalid = True
-                        if expiry_invalid:
-                            # A time-limited override with an unreadable expiry must never
-                            # be promoted to an indefinite one — discard it instead.
-                            print(f"Discarding manual override with invalid expiry: {saved_expiry!r}")
-                            saved_override = None
-                        elif expiry is not None and expiry <= datetime.now():
-                            # Drop an override that expired while the app was closed
-                            saved_override = None
-                            expiry = None
-                        self.override_active = saved_override
-                        self.override_expiry = expiry if saved_override else None
-                        self.override_mode.set(saved_override or "AUTO")
+                    self.override_active = saved_override
+                    self.override_expiry = expiry if saved_override else None
+                    self.override_mode.set(saved_override or "AUTO")
 
-                    # Notification settings
-                    self.notif_stale_enabled.set(settings.get('notif_stale_enabled', False))
-                    self.notif_stale_minutes.set(settings.get('notif_stale_minutes', '10'))
-                    self.notif_stale_url.set(settings.get('notif_stale_url', ''))
-                    self.notif_open_enabled.set(settings.get('notif_open_enabled', False))
-                    self.notif_open_url.set(settings.get('notif_open_url', ''))
-                    self.notif_closed_enabled.set(settings.get('notif_closed_enabled', False))
-                    self.notif_closed_url.set(settings.get('notif_closed_url', ''))
-                    self.notif_heartbeat_enabled.set(settings.get('notif_heartbeat_enabled', False))
-                    self.notif_heartbeat_minutes.set(settings.get('notif_heartbeat_minutes', '5'))
-                    self.notif_heartbeat_url.set(settings.get('notif_heartbeat_url', ''))
+                # Notification settings
+                self.notif_stale_enabled.set(settings.get('notif_stale_enabled', False))
+                self.notif_stale_minutes.set(settings.get('notif_stale_minutes', '10'))
+                self.notif_stale_url.set(settings.get('notif_stale_url', ''))
+                self.notif_open_enabled.set(settings.get('notif_open_enabled', False))
+                self.notif_open_url.set(settings.get('notif_open_url', ''))
+                self.notif_closed_enabled.set(settings.get('notif_closed_enabled', False))
+                self.notif_closed_url.set(settings.get('notif_closed_url', ''))
+                self.notif_heartbeat_enabled.set(settings.get('notif_heartbeat_enabled', False))
+                self.notif_heartbeat_minutes.set(settings.get('notif_heartbeat_minutes', '5'))
+                self.notif_heartbeat_url.set(settings.get('notif_heartbeat_url', ''))
         except Exception as e:
             print(f"Error loading settings: {e}")
 
@@ -295,8 +322,10 @@ class RoofClassifierApp:
                 'notif_heartbeat_minutes': self.notif_heartbeat_minutes.get(),
                 'notif_heartbeat_url': self.notif_heartbeat_url.get(),
             }
-            with open(SETTINGS_FILE, 'w') as f:
-                json.dump(settings, f, indent=2)
+            # Atomic: a crash part-way through a settings save used to leave an
+            # unparseable file, which silently reset every setting - including the
+            # persisted ASCOM UniqueID and any active manual override.
+            write_json_atomic(SETTINGS_FILE, settings)
         except Exception as e:
             print(f"Error saving settings: {e}")
 
@@ -542,7 +571,10 @@ class RoofClassifierApp:
         except Exception as e:
             if hasattr(self, 'logger') and self.logger:
                 self.logger.error(f"Error calculating sun angle: {e}")
-            return 0.0  # Default to 0 if calculation fails
+            # None means "unknown". It used to be 0.0, which is indistinguishable
+            # from a real sunrise-altitude reading; callers must handle the
+            # unknown case explicitly instead of acting on a fabricated angle.
+            return None
 
     def is_sun_safe_for_open(self, config=None):
         """Check if sun angle is safe to report 'open' status.
@@ -553,17 +585,24 @@ class RoofClassifierApp:
             if config is None:
                 config = self._get_monitor_config() or {}
             sun_angle = self.calculate_sun_angle(config)
+            if sun_angle is None:
+                if hasattr(self, 'logger') and self.logger:
+                    self.logger.error(
+                        "Sun altitude unknown - treating conditions as unsafe for OPEN")
+                return False
             threshold = float(config['sun_angle_threshold'])
             is_safe = sun_angle < threshold
-            
+
             if hasattr(self, 'logger') and self.logger:
                 self.logger.info(f"Sun angle: {sun_angle:.1f}°, Threshold: {threshold:.1f}°, Safe for open: {is_safe}")
-            
+
             return is_safe
         except Exception as e:
             if hasattr(self, 'logger') and self.logger:
                 self.logger.error(f"Error checking sun safety: {e}")
-            return True  # Default to safe if calculation fails
+            # Fail closed. Reporting "safe to be open" on the strength of a failed
+            # calculation is the one outcome that can expose equipment to daylight.
+            return False
 
     # ── Thread-safe configuration snapshots ───────────────────────────────────
     #
@@ -590,6 +629,18 @@ class RoofClassifierApp:
             'training_data_folder': self.training_data_folder.get().strip(),
             'save_on_toggle': self.save_on_toggle_enabled.get(),
             'save_on_disagreement': self.save_on_disagreement_enabled.get(),
+            # Notification settings: _check_and_send_notifications runs on the
+            # monitor thread, so it must read these from the snapshot too.
+            'notif_stale_enabled': self.notif_stale_enabled.get(),
+            'notif_stale_minutes': self.notif_stale_minutes.get(),
+            'notif_stale_url': self.notif_stale_url.get().strip(),
+            'notif_open_enabled': self.notif_open_enabled.get(),
+            'notif_open_url': self.notif_open_url.get().strip(),
+            'notif_closed_enabled': self.notif_closed_enabled.get(),
+            'notif_closed_url': self.notif_closed_url.get().strip(),
+            'notif_heartbeat_enabled': self.notif_heartbeat_enabled.get(),
+            'notif_heartbeat_minutes': self.notif_heartbeat_minutes.get(),
+            'notif_heartbeat_url': self.notif_heartbeat_url.get().strip(),
         }
 
     def _request_monitor_config(self, timeout=5.0):
@@ -641,16 +692,7 @@ class RoofClassifierApp:
 
         Returns (status, last_line) where status is None if nothing could be parsed.
         """
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        if not lines:
-            return None, ""
-        last_line = lines[-1]
-        upper = last_line.upper()
-        if "OPEN" in upper:
-            return "OPEN", last_line
-        if "CLOSED" in upper:
-            return "CLOSED", last_line
-        return None, last_line
+        return parse_roof_status(text)
 
     def _fetch_secondary_from_url(self, url):
         """Fetch and parse the secondary roof status from an HTTP(S) URL.
@@ -1486,13 +1528,58 @@ class RoofClassifierApp:
         scrollbar.pack(side="right", fill="y")
         text_widget.config(state=tk.DISABLED)
 
-    def classify_latest_png(self, config=None):
+    def classify_latest_png(self, config=None, max_cache_age=CLASSIFICATION_CACHE_SECONDS):
         """Classify the newest frame and write the roof status file.
 
         Runs on the monitor thread and on the ASCOM server thread as well as the UI
-        thread, so all configuration comes from a plain snapshot rather than from the
-        Tk variables directly.
+        thread. Only one classification happens at a time: concurrent callers would
+        otherwise interleave writes to the status file and corrupt the shared
+        toggle/disagreement state. A caller arriving while a result less than
+        *max_cache_age* seconds old is available reuses that result instead of
+        re-running the pipeline; pass ``max_cache_age=0`` to force a fresh pass.
         """
+        with self._classify_lock:
+            cached = self.get_cached_classification(max_cache_age)
+            if cached is not None:
+                filename, status, _age = cached
+                return filename, status
+            return self._classify_latest_png_uncached(config)
+
+    def get_cached_classification(self, max_age_seconds):
+        """Return ``(filename, status, age_seconds)`` if a recent enough result exists.
+
+        Returns None when nothing has been classified yet or the last result is
+        older than *max_age_seconds*.
+        """
+        if max_age_seconds <= 0:
+            return None  # caller explicitly wants a fresh pass
+        snapshot = self._last_classification
+        if not snapshot:
+            return None
+        filename, status, taken_at = snapshot
+        age = (datetime.now(timezone.utc) - taken_at).total_seconds()
+        if age > max_age_seconds:
+            return None
+        return filename, status, age
+
+    def get_cached_status(self, max_age_seconds=CLASSIFICATION_MAX_AGE_SECONDS):
+        """Return ``(status, age_seconds)`` for the ASCOM safety monitor.
+
+        ``status`` is None when no usable recent classification exists, in which
+        case the caller must treat conditions as unsafe rather than reusing an old
+        answer. ``age_seconds`` is None only when nothing has ever been classified.
+        """
+        snapshot = self._last_classification
+        if not snapshot:
+            return None, None
+        _filename, status, taken_at = snapshot
+        age = (datetime.now(timezone.utc) - taken_at).total_seconds()
+        if age > max_age_seconds:
+            return None, age
+        return status, age
+
+    def _classify_latest_png_uncached(self, config=None):
+        """Run one full classification pass. Callers must hold _classify_lock."""
         if not self.model:
             if self.logger:
                 self.logger.error("No model loaded")
@@ -1571,9 +1658,10 @@ class RoofClassifierApp:
         # Log the analysis
         now = datetime.now().strftime("%Y-%m-%d %I:%M:%S%p")
         sun_angle = self.calculate_sun_angle(config)
-        
+
         log_message = f"Image: {latest}, Raw prediction: {image_status}, Final status: {final_status}"
-        log_message += f", Sun angle: {sun_angle:.1f}°"
+        log_message += (", Sun angle: unknown" if sun_angle is None
+                        else f", Sun angle: {sun_angle:.1f}°")
         
         if secondary_status:
             log_message += f", Secondary source: {secondary_status} (updated: {secondary_time})"
@@ -1620,6 +1708,8 @@ class RoofClassifierApp:
             except OSError:
                 pass
         
+        self._last_classification = (latest, final_status, datetime.now(timezone.utc))
+
         print(f"[{final_status}] {latest}")
         return latest, final_status
 
@@ -1633,10 +1723,11 @@ class RoofClassifierApp:
             output_path = self.output_path.get()
         if timestamp is None:
             timestamp = datetime.now().strftime("%Y-%m-%d %I:%M:%S%p")
-        line = f"???{timestamp} Roof Status: {status}{reason}\n"
+        line = format_status_line(status, reason, timestamp)
         try:
-            with open(output_path, "w") as f:
-                f.write(line)
+            # Written atomically: ASCOM clients and SkyRoof poll this file, and a
+            # plain truncate-then-write lets them read an empty or partial line.
+            atomic_write_text(output_path, line)
             return True
         except Exception as e:
             if self.logger:
@@ -1744,23 +1835,32 @@ class RoofClassifierApp:
             if self.logger:
                 self.logger.error(f"Failed to send webhook to {url}: {e}")
 
-    def _check_and_send_notifications(self, status):
+    def _check_and_send_notifications(self, status, config=None):
         """Check notification conditions and fire webhooks as appropriate.
 
-        Called from the monitor background thread after each classification cycle.
+        Called from the monitor background thread after each classification cycle,
+        so every setting comes from the *config* snapshot rather than from the Tk
+        variables, which may only be read on the UI thread.
         """
+        if config is None:
+            config = self._get_monitor_config()
+        if config is None:
+            if self.logger:
+                self.logger.error("Skipping notifications: no configuration available")
+            return
+
         now = datetime.utcnow()
         ts = now.isoformat() + "Z"
 
         # Roof open transition notification
-        if self.notif_open_enabled.get() and status == "OPEN" and self.previous_status != "OPEN":
-            url = self.notif_open_url.get().strip()
+        if config.get('notif_open_enabled') and status == "OPEN" and self.previous_status != "OPEN":
+            url = config.get('notif_open_url', '')
             if url:
                 self._send_webhook(url, {"event": "roof_open", "status": status, "timestamp": ts})
 
         # Roof closed transition notification
-        if self.notif_closed_enabled.get() and status == "CLOSED" and self.previous_status != "CLOSED":
-            url = self.notif_closed_url.get().strip()
+        if config.get('notif_closed_enabled') and status == "CLOSED" and self.previous_status != "CLOSED":
+            url = config.get('notif_closed_url', '')
             if url:
                 self._send_webhook(url, {"event": "roof_closed", "status": status, "timestamp": ts})
 
@@ -1774,14 +1874,14 @@ class RoofClassifierApp:
         is_stale = False
         if self.last_new_hash_time is not None:
             try:
-                stale_minutes_val = float(self.notif_stale_minutes.get())
-            except ValueError:
+                stale_minutes_val = float(config.get('notif_stale_minutes', 10))
+            except (TypeError, ValueError):
                 stale_minutes_val = 10.0
             elapsed_minutes = (now - self.last_new_hash_time).total_seconds() / 60.0
             is_stale = elapsed_minutes >= stale_minutes_val
 
-        if self.notif_stale_enabled.get() and is_stale:
-            url = self.notif_stale_url.get().strip()
+        if config.get('notif_stale_enabled') and is_stale:
+            url = config.get('notif_stale_url', '')
             if url:
                 # Re-send at most once per stale_minutes interval
                 already_sent = (
@@ -1799,12 +1899,12 @@ class RoofClassifierApp:
 
         # Heartbeat notification — fires every heartbeat_minutes interval while monitoring is
         # active, but is suppressed whenever the image is stale.
-        if self.notif_heartbeat_enabled.get() and not is_stale:
-            url = self.notif_heartbeat_url.get().strip()
+        if config.get('notif_heartbeat_enabled') and not is_stale:
+            url = config.get('notif_heartbeat_url', '')
             if url:
                 try:
-                    heartbeat_minutes = float(self.notif_heartbeat_minutes.get())
-                except ValueError:
+                    heartbeat_minutes = float(config.get('notif_heartbeat_minutes', 5))
+                except (TypeError, ValueError):
                     heartbeat_minutes = 5.0
                 interval_elapsed = (
                     self._last_heartbeat_time is None
@@ -1862,7 +1962,12 @@ class RoofClassifierApp:
             sun_angle = self.calculate_sun_angle()
             threshold = float(self.sun_angle_threshold.get())
         except Exception:
-            self.sun_status_label.config(text="Sun altitude: error", fg="gray")
+            sun_angle = None
+            threshold = None
+
+        if sun_angle is None or threshold is None:
+            self.sun_status_label.config(
+                text="⚠ Sun altitude: unknown (treated as UNSAFE)", fg="darkorange")
             return
 
         if sun_angle < threshold:
@@ -2001,7 +2106,8 @@ class RoofClassifierApp:
 
         def work():
             try:
-                filename, status = self.classify_latest_png(config)
+                # Force a fresh pass: any cached result predates the override change.
+                filename, status = self.classify_latest_png(config, max_cache_age=0)
                 self.root.after(0, lambda f=filename, s=status: self.update_monitoring_status(f, s))
             except Exception as e:
                 if self.logger:
@@ -2314,12 +2420,12 @@ class RoofClassifierApp:
                     self.logger.error("Skipping monitoring cycle: no configuration available")
                 filename, status = None, "No configuration available"
             else:
-                filename, status = self.classify_latest_png(config)
+                filename, status = self.classify_latest_png(config, max_cache_age=0)
             self.root.after(0, lambda f=filename, s=status: self.update_monitoring_status(f, s))
 
             # Send notifications if configured (runs in background thread)
-            if status in ("OPEN", "CLOSED"):
-                self._check_and_send_notifications(status)
+            if status in ("OPEN", "CLOSED") and config is not None:
+                self._check_and_send_notifications(status, config)
             
             # Countdown loop with 1-second updates
             for remaining in range(check_interval, 0, -1):
@@ -2374,6 +2480,7 @@ class RoofClassifierApp:
         self.last_new_hash_time = None
         self.previous_classified_status = None
         self._in_disagreement = False
+        self._last_classification = None
         self.status_label.config(text="Monitoring: Starting...", fg="blue")
         self.countdown_label.config(text="")
         self.statusbar_label.config(text="● Monitoring: Active", fg="green")

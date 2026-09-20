@@ -1,0 +1,137 @@
+"""Classification is serialised and its result is shared between callers.
+
+The monitor thread and the ASCOM server thread both want the current roof state.
+Letting both run the pipeline meant two writers on the status file and a shared
+toggle/disagreement baseline being advanced twice per cycle.
+"""
+
+import threading
+import time
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+import synthetic_roofstatus as srs
+
+
+@pytest.fixture
+def classifier(app):
+    """App fixture with a stubbed classification pass that records its calls."""
+    app._classify_lock = threading.RLock()
+    app._last_classification = None
+    app.calls = []
+
+    def fake_pass(config=None):
+        app.calls.append(config)
+        status = "OPEN" if len(app.calls) % 2 else "CLOSED"
+        filename = f"frame{len(app.calls)}.png"
+        app._last_classification = (filename, status, datetime.now(timezone.utc))
+        return filename, status
+
+    app._classify_latest_png_uncached = fake_pass
+    return app
+
+
+def test_first_call_runs_the_pipeline(classifier):
+    filename, status = classifier.classify_latest_png({'k': 'v'})
+
+    assert (filename, status) == ("frame1.png", "OPEN")
+    assert classifier.calls == [{'k': 'v'}]
+
+
+def test_second_call_reuses_the_cached_result(classifier):
+    first = classifier.classify_latest_png({})
+    second = classifier.classify_latest_png({})
+
+    assert first == second
+    assert len(classifier.calls) == 1, "pipeline ran twice for one cycle"
+
+
+def test_zero_max_age_forces_a_fresh_pass(classifier):
+    """The monitor loop and a post-override refresh must not see a stale answer."""
+    classifier.classify_latest_png({})
+    _filename, status = classifier.classify_latest_png({}, max_cache_age=0)
+
+    assert len(classifier.calls) == 2
+    assert status == "CLOSED"
+
+
+def test_expired_cache_triggers_a_fresh_pass(classifier):
+    classifier.classify_latest_png({})
+    filename, status, taken_at = classifier._last_classification
+    classifier._last_classification = (
+        filename, status, taken_at - timedelta(seconds=srs.CLASSIFICATION_CACHE_SECONDS + 5)
+    )
+
+    classifier.classify_latest_png({})
+
+    assert len(classifier.calls) == 2
+
+
+def test_concurrent_callers_do_not_interleave(app):
+    """Two threads asking at once produce exactly one pipeline run at a time."""
+    app._classify_lock = threading.RLock()
+    app._last_classification = None
+    overlaps = []
+    active = []
+    lock = threading.Lock()
+
+    def slow_pass(config=None):
+        with lock:
+            active.append(1)
+            if len(active) > 1:
+                overlaps.append(len(active))
+        time.sleep(0.05)
+        with lock:
+            active.pop()
+        app._last_classification = ("f.png", "OPEN", datetime.now(timezone.utc))
+        return "f.png", "OPEN"
+
+    app._classify_latest_png_uncached = slow_pass
+
+    threads = [
+        threading.Thread(target=lambda: app.classify_latest_png({}, max_cache_age=0))
+        for _ in range(4)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert overlaps == [], "classification passes overlapped"
+
+
+# ── get_cached_status: what the ASCOM safety monitor consumes ─────────────────
+
+def test_cached_status_is_none_before_anything_is_classified(app):
+    app._last_classification = None
+    assert app.get_cached_status() == (None, None)
+
+
+def test_cached_status_returns_a_fresh_result(app):
+    app._last_classification = ("f.png", "OPEN", datetime.now(timezone.utc))
+
+    status, age = app.get_cached_status()
+
+    assert status == "OPEN"
+    assert age < 5
+
+
+def test_cached_status_refuses_a_stale_result(app):
+    """A stale classification must not keep being reported as authoritative."""
+    stale = datetime.now(timezone.utc) - timedelta(
+        seconds=srs.CLASSIFICATION_MAX_AGE_SECONDS + 60)
+    app._last_classification = ("f.png", "OPEN", stale)
+
+    status, age = app.get_cached_status()
+
+    assert status is None
+    assert age > srs.CLASSIFICATION_MAX_AGE_SECONDS
+
+
+def test_cached_status_honours_a_custom_max_age(app):
+    app._last_classification = (
+        "f.png", "OPEN", datetime.now(timezone.utc) - timedelta(seconds=30))
+
+    assert app.get_cached_status(60)[0] == "OPEN"
+    assert app.get_cached_status(10)[0] is None

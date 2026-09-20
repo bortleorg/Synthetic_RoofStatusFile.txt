@@ -9,3 +9,6 @@ __pycache__/
 *.pyd
 .env
 temp_status.txt
+ascom_alpaca_safety.log
+*.corrupt
+.pytest_cache/
