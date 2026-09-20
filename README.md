@@ -65,9 +65,10 @@ The **Manual Override** panel forces the reported roof status regardless of what
 
 While an override is active:
 
-- The output status file reports the forced status, annotated as `(Manual override: OPEN|CLOSED)`.
+- The output status file reports the forced status, annotated as `(Manual override: OPEN|CLOSED)`. It is written the moment you click **"Apply Override"**, not on the next monitoring cycle, so the file is correct even when monitoring is stopped.
 - ASCOM clients see the forced status.
-- The override is written to the settings file, so it survives an app restart. An override whose expiry passed while the app was closed is discarded on the next launch.
+- Clearing an override immediately re-classifies the latest image and rewrites the status file, so the forced line never lingers. (If no model is loaded there is nothing to re-classify, and a warning is logged instead.)
+- The override is written to the settings file, so it survives an app restart. An override whose expiry passed while the app was closed is discarded on the next launch, as is one whose stored expiry is unreadable — a corrupt settings file will never silently turn a timed override into a permanent one.
 - Every applied, expired, and cleared override is logged at `WARNING` level.
 
 > **Safety note:** the sun angle guard is still applied to the ASCOM `IsSafe` flag. A forced `OPEN` is written to the status file, but ASCOM clients will not be told it is safe while the sun is above the configured threshold. To defeat the sun guard as well, change the Sun Angle Threshold in the Configuration tab.

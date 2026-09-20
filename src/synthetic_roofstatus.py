@@ -119,6 +119,9 @@ class RoofClassifierApp:
         # Cached secondary roof status when the source is an HTTP URL
         self._secondary_cache = None     # (source, status, mod_time, fetched_at) or None
 
+        # Last configuration snapshot handed to a worker thread (see _get_monitor_config)
+        self._last_monitor_config = None
+
         # Image hash tracking state
         self.last_image_hash = None
         self.last_new_hash_time = None  # datetime (UTC) when hash last changed
@@ -216,17 +219,23 @@ class RoofClassifierApp:
                     saved_expiry = settings.get('override_expiry') or None
                     if saved_override in ("OPEN", "CLOSED"):
                         expiry = None
+                        expiry_invalid = False
                         if saved_expiry:
                             try:
                                 expiry = datetime.fromisoformat(saved_expiry)
-                            except ValueError:
-                                expiry = None
-                        # Drop an override that expired while the app was closed
-                        if expiry is not None and expiry <= datetime.now():
+                            except (ValueError, TypeError):
+                                expiry_invalid = True
+                        if expiry_invalid:
+                            # A time-limited override with an unreadable expiry must never
+                            # be promoted to an indefinite one — discard it instead.
+                            print(f"Discarding manual override with invalid expiry: {saved_expiry!r}")
+                            saved_override = None
+                        elif expiry is not None and expiry <= datetime.now():
+                            # Drop an override that expired while the app was closed
                             saved_override = None
                             expiry = None
                         self.override_active = saved_override
-                        self.override_expiry = expiry
+                        self.override_expiry = expiry if saved_override else None
                         self.override_mode.set(saved_override or "AUTO")
 
                     # Notification settings
@@ -508,13 +517,19 @@ class RoofClassifierApp:
             messagebox.showerror("Error", f"Could not open setup page: {str(e)}\n\n"
                                 f"Try manually opening: http://localhost:{self.ascom_port.get()}/setup")
 
-    def calculate_sun_angle(self):
-        """Calculate the sun's elevation angle for the given location using UTC"""
+    def calculate_sun_angle(self, config=None):
+        """Calculate the sun's elevation angle for the given location using UTC.
+
+        *config* is an optional snapshot from _get_monitor_config; one is obtained
+        automatically when omitted, which keeps worker-thread callers off Tk.
+        """
         try:
+            if config is None:
+                config = self._get_monitor_config() or {}
             # Create observer for the given location
             observer = ephem.Observer()
-            observer.lat = str(float(self.latitude.get()))
-            observer.lon = str(float(self.longitude.get()))
+            observer.lat = str(float(config['latitude']))
+            observer.lon = str(float(config['longitude']))
             # Use UTC time for calculations
             observer.date = ephem.now()
             
@@ -529,11 +544,16 @@ class RoofClassifierApp:
                 self.logger.error(f"Error calculating sun angle: {e}")
             return 0.0  # Default to 0 if calculation fails
 
-    def is_sun_safe_for_open(self):
-        """Check if sun angle is safe to report 'open' status"""
+    def is_sun_safe_for_open(self, config=None):
+        """Check if sun angle is safe to report 'open' status.
+
+        *config* is an optional snapshot from _get_monitor_config (see above).
+        """
         try:
-            sun_angle = self.calculate_sun_angle()
-            threshold = float(self.sun_angle_threshold.get())
+            if config is None:
+                config = self._get_monitor_config() or {}
+            sun_angle = self.calculate_sun_angle(config)
+            threshold = float(config['sun_angle_threshold'])
             is_safe = sun_angle < threshold
             
             if hasattr(self, 'logger') and self.logger:
@@ -544,6 +564,71 @@ class RoofClassifierApp:
             if hasattr(self, 'logger') and self.logger:
                 self.logger.error(f"Error checking sun safety: {e}")
             return True  # Default to safe if calculation fails
+
+    # ── Thread-safe configuration snapshots ───────────────────────────────────
+    #
+    # Tk variables may only be touched from the thread running the main loop, but
+    # the monitor loop and the ASCOM server both need the current configuration.
+    # They therefore work from a plain-dict snapshot taken on the UI thread.
+
+    def _snapshot_monitor_config(self):
+        """Read every Tk variable the monitoring path needs into a plain dict.
+
+        Must be called on the UI thread.
+        """
+        return {
+            'camera_url': self.camera_url.get().strip(),
+            'monitor_path': self.monitor_path.get(),
+            'output_path': self.output_path.get(),
+            'secondary_enabled': self.secondary_source_enabled.get(),
+            'secondary_source': self.secondary_source_path.get().strip(),
+            'latitude': self.latitude.get(),
+            'longitude': self.longitude.get(),
+            'sun_angle_threshold': self.sun_angle_threshold.get(),
+            'sample_mode_enabled': self.sample_mode_enabled.get(),
+            'sample_rate': self.sample_rate.get(),
+            'training_data_folder': self.training_data_folder.get().strip(),
+            'save_on_toggle': self.save_on_toggle_enabled.get(),
+            'save_on_disagreement': self.save_on_disagreement_enabled.get(),
+        }
+
+    def _request_monitor_config(self, timeout=5.0):
+        """Ask the UI thread for a configuration snapshot and wait for it.
+
+        Returns the most recent snapshot if the UI thread does not answer in time,
+        or None if there has never been one.
+        """
+        result = {}
+        done = threading.Event()
+
+        def grab():
+            try:
+                result.update(self._snapshot_monitor_config())
+            except Exception:
+                pass
+            finally:
+                done.set()
+
+        try:
+            self.root.after(0, grab)
+        except Exception:
+            return self._last_monitor_config
+
+        if done.wait(timeout) and result:
+            self._last_monitor_config = result
+            return result
+
+        if self.logger:
+            self.logger.warning("Timed out waiting for a configuration snapshot from the UI thread")
+        return self._last_monitor_config
+
+    def _get_monitor_config(self):
+        """Return a configuration snapshot, however the caller's thread allows."""
+        if threading.current_thread() is threading.main_thread():
+            config = self._snapshot_monitor_config()
+            self._last_monitor_config = config
+            return config
+        return self._request_monitor_config()
 
     @staticmethod
     def _is_http_source(path):
@@ -602,17 +687,32 @@ class RoofClassifierApp:
 
         return status, mod_time
 
-    def read_secondary_source(self):
+    def read_secondary_source(self, config=None):
         """Read the secondary source roof status from a local file or an HTTP(S) URL.
 
         Returns (status, mod_time_utc), or (None, None) when unavailable/unparseable.
+        Pass *config* (a snapshot from _get_monitor_config) when calling from a worker
+        thread; without it the Tk variables are read directly, which is only safe on
+        the UI thread.
+        """
+        if config is None:
+            config = self._get_monitor_config()
+        if config is None:
+            return None, None
+        return self._read_secondary_values(config.get('secondary_enabled'),
+                                           config.get('secondary_source', ''))
+
+    def _read_secondary_values(self, enabled, source):
+        """Secondary-source reader working purely from plain values — no Tk access,
+        so it is safe on any thread.
+
         URL results are cached briefly so repeated UI refreshes do not issue a network
         request per call.
         """
-        if not self.secondary_source_enabled.get() or not self.secondary_source_path.get():
+        if not enabled or not source:
             return None, None
 
-        source = self.secondary_source_path.get().strip()
+        source = source.strip()
 
         if self._is_http_source(source):
             # Serve from cache when it is still fresh and for the same URL
@@ -1154,13 +1254,15 @@ class RoofClassifierApp:
 
         tk.Button(utils_frame, text="Convert FITS to PNG", command=self.convert_fits_to_png).pack(side=tk.LEFT, padx=5)
 
-    def _get_training_class_folder(self, label):
+    def _get_training_class_folder(self, label, base=None):
         """Return the full path to a training class subfolder (open/closed/unclassified/other).
 
         If a training_data_folder has been configured it is used as the base; otherwise the
         folder name is returned as-is for backward-compatible relative-path behaviour.
+        Worker threads pass *base* from a configuration snapshot rather than letting this
+        read the Tk variable.
         """
-        base = self.training_data_folder.get().strip()
+        base = self.training_data_folder.get().strip() if base is None else base.strip()
         if base:
             return os.path.join(base, label)
         return label
@@ -1384,13 +1486,27 @@ class RoofClassifierApp:
         scrollbar.pack(side="right", fill="y")
         text_widget.config(state=tk.DISABLED)
 
-    def classify_latest_png(self):
+    def classify_latest_png(self, config=None):
+        """Classify the newest frame and write the roof status file.
+
+        Runs on the monitor thread and on the ASCOM server thread as well as the UI
+        thread, so all configuration comes from a plain snapshot rather than from the
+        Tk variables directly.
+        """
         if not self.model:
             if self.logger:
                 self.logger.error("No model loaded")
             return None, "No model loaded"
 
-        img_path, latest, is_temp, error = self._resolve_latest_image()
+        if config is None:
+            config = self._get_monitor_config()
+        if config is None:
+            if self.logger:
+                self.logger.error("No configuration snapshot available")
+            return None, "No configuration available"
+
+        img_path, latest, is_temp, error = self._resolve_latest_image(
+            config['camera_url'], config['monitor_path'])
         if img_path is None:
             if self.logger:
                 self.logger.error(f"Could not obtain an image to classify: {error}")
@@ -1400,7 +1516,7 @@ class RoofClassifierApp:
 
         if not is_temp:
             # Optionally save a random sample for manual classification
-            self.save_sample_if_needed(img_path)
+            self.save_sample_if_needed(img_path, config)
 
         # Show the frame we are about to classify on the Monitoring tab
         self._capture_preview(img_path, latest)
@@ -1417,7 +1533,7 @@ class RoofClassifierApp:
                 self.logger.warning(f"Could not compute image hash for {img_path}: {e}")
 
         # Get secondary source status for comparison
-        secondary_status, secondary_time = self.read_secondary_source()
+        secondary_status, secondary_time = self.read_secondary_source(config)
         
         # Classify the image
         img = self.prep_image(img_path).flatten().reshape(1, -1)
@@ -1425,7 +1541,7 @@ class RoofClassifierApp:
         image_status = "OPEN" if pred == 1 else "CLOSED"
         
         # Apply sun angle guard rails
-        sun_safe = self.is_sun_safe_for_open()
+        sun_safe = self.is_sun_safe_for_open(config)
         if image_status == "OPEN" and not sun_safe:
             if self.logger:
                 self.logger.warning(f"Image classification suggests OPEN, but sun angle too high - overriding to CLOSED")
@@ -1434,6 +1550,11 @@ class RoofClassifierApp:
         else:
             final_status = image_status
             override_reason = ""
+
+        # The status the app would report with no manual override in force. Toggle
+        # capture is baselined on this so that applying or clearing an override never
+        # looks like a model transition.
+        model_status = final_status
 
         # Apply the manual override last — it wins over both the model and the sun guard
         # for the reported roof status. (The ASCOM IsSafe flag keeps its own sun check.)
@@ -1449,7 +1570,7 @@ class RoofClassifierApp:
 
         # Log the analysis
         now = datetime.now().strftime("%Y-%m-%d %I:%M:%S%p")
-        sun_angle = self.calculate_sun_angle()
+        sun_angle = self.calculate_sun_angle(config)
         
         log_message = f"Image: {latest}, Raw prediction: {image_status}, Final status: {final_status}"
         log_message += f", Sun angle: {sun_angle:.1f}°"
@@ -1473,28 +1594,24 @@ class RoofClassifierApp:
                         f"MODEL/SECONDARY MISMATCH: model={image_status} (final={final_status}) "
                         f"!= secondary={secondary_status} (updated: {secondary_time}) for image {latest}"
                     )
-                if self.save_on_disagreement_enabled.get() and not self._in_disagreement:
-                    self._save_frame_for_review(img_path, "disagree")
+                if config['save_on_disagreement'] and not self._in_disagreement:
+                    self._save_frame_for_review(img_path, "disagree", config)
                 self._in_disagreement = True
             else:
                 self._in_disagreement = False
 
         # ── State toggle capture ──────────────────────────────────────────────
-        # When the reported status flips, save the frame so a wrongly-classified
-        # transition can be reviewed/labelled later.
-        # A flip caused by a manual override says nothing about the model, so skip it.
-        if (self.save_on_toggle_enabled.get()
-                and not manual_override
+        # When the model's own status flips, save the frame so a wrongly-classified
+        # transition can be reviewed/labelled later. This tracks model_status, not the
+        # reported status: an override being applied or cleared is not a model toggle,
+        # and must not advance the baseline either.
+        if (config['save_on_toggle']
                 and self.previous_classified_status is not None
-                and final_status != self.previous_classified_status):
-            self._save_frame_for_review(img_path, "toggle")
-        self.previous_classified_status = final_status
+                and model_status != self.previous_classified_status):
+            self._save_frame_for_review(img_path, "toggle", config)
+        self.previous_classified_status = model_status
 
-        # Write to output file (overwrite with current status as a single line)
-        # Format follows the SRO Roof File spec: https://interactiveastronomy.com/skyroof_help/SROrooffile.html
-        line = f"???{now} Roof Status: {final_status}{override_reason}\n"
-        with open(self.output_path.get(), "w") as f:
-            f.write(line)
+        self._write_status_file(final_status, override_reason, config['output_path'], now)
 
         # Clean up temp file for URL mode
         if tmp_path:
@@ -1505,6 +1622,26 @@ class RoofClassifierApp:
         
         print(f"[{final_status}] {latest}")
         return latest, final_status
+
+    def _write_status_file(self, status, reason="", output_path=None, timestamp=None):
+        """Write the roof status file as a single line.
+
+        Format follows the SRO Roof File spec:
+        https://interactiveastronomy.com/skyroof_help/SROrooffile.html
+        """
+        if output_path is None:
+            output_path = self.output_path.get()
+        if timestamp is None:
+            timestamp = datetime.now().strftime("%Y-%m-%d %I:%M:%S%p")
+        line = f"???{timestamp} Roof Status: {status}{reason}\n"
+        try:
+            with open(output_path, "w") as f:
+                f.write(line)
+            return True
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"Could not write status file {output_path}: {e}")
+            return False
 
     def update_monitoring_status(self, filename, status):
         """Update the monitoring status display"""
@@ -1758,11 +1895,23 @@ class RoofClassifierApp:
                     + timedelta(days=1))
         return None  # "Forever"
 
+    def _defer_to_ui(self, func):
+        """Run *func* on the UI thread, immediately if already there."""
+        if threading.current_thread() is threading.main_thread():
+            func()
+            return
+        try:
+            self.root.after(0, func)
+        except Exception:
+            pass  # window is closing
+
     def get_manual_override(self):
         """Return "OPEN"/"CLOSED" while a manual override is in force, else None.
 
         An expired override is cleared as a side effect. Safe to call from the monitor
-        thread: all Tk widget work is deferred to the UI thread.
+        thread: the in-memory state is updated here, and everything that touches Tk —
+        including save_settings(), which reads every Tk variable — is deferred to the
+        UI thread.
         """
         if self.override_active is None:
             return None
@@ -1770,15 +1919,18 @@ class RoofClassifierApp:
             expired = self.override_active
             self.override_active = None
             self.override_expiry = None
-            self.save_settings()
             if self.logger:
-                self.logger.info(f"Manual override ({expired}) expired — reverting to model output")
-            try:
-                self.root.after(0, self._sync_override_ui)
-            except Exception:
-                pass
+                self.logger.warning(
+                    f"Manual override ({expired}) expired — reverting to model output"
+                )
+            self._defer_to_ui(self._finalize_override_change)
             return None
         return self.override_active
+
+    def _finalize_override_change(self):
+        """Persist the override state and resync the widgets (UI thread only)."""
+        self._sync_override_ui()
+        self.save_settings()
 
     def _sync_override_ui(self):
         """Bring the override radio buttons and label back in line with the committed
@@ -1802,10 +1954,19 @@ class RoofClassifierApp:
         if self.logger:
             self.logger.warning(f"MANUAL OVERRIDE APPLIED: reporting {mode} until {until}")
         self._update_override_display()
+
+        # Write the forced status straight away. Waiting for the next monitoring cycle
+        # would leave the status file — and therefore ASCOM clients — reporting the
+        # previous result for up to a minute, or indefinitely if monitoring is stopped.
+        written = self._write_status_file(mode, f" (Manual override: {mode})")
+
+        note = ("The status file has been updated immediately."
+                if written else
+                "WARNING: the status file could not be written — check the output path.")
         messagebox.showinfo(
             "Manual Override Active",
             f"Roof status will be reported as {mode} until {until}.\n\n"
-            "This applies to the status file and to ASCOM clients.\n\n"
+            f"This applies to the status file and to ASCOM clients. {note}\n\n"
             "Note: the sun angle guard still applies to the ASCOM 'IsSafe' flag, so a\n"
             "forced OPEN will not be reported as safe while the sun is above the\n"
             "configured threshold."
@@ -1821,6 +1982,32 @@ class RoofClassifierApp:
         if was and self.logger:
             self.logger.warning(f"Manual override ({was}) cleared — reverting to model output")
         self._update_override_display()
+        if was:
+            # Re-classify now so the status file stops reporting the cleared override
+            self._refresh_status_now()
+
+    def _refresh_status_now(self):
+        """Re-run classification in the background so the status file reflects the
+        current model output without waiting for the next monitoring cycle."""
+        if not self.model:
+            if self.logger:
+                self.logger.warning(
+                    "Override cleared but no model is loaded — the status file still holds "
+                    "the last written status"
+                )
+            return
+
+        config = self._snapshot_monitor_config()
+
+        def work():
+            try:
+                filename, status = self.classify_latest_png(config)
+                self.root.after(0, lambda f=filename, s=status: self.update_monitoring_status(f, s))
+            except Exception as e:
+                if self.logger:
+                    self.logger.error(f"Error refreshing status after override change: {e}")
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _format_override_remaining(self):
         """Human-readable time left on the current override."""
@@ -2028,16 +2215,12 @@ class RoofClassifierApp:
             return
 
         def do_test():
-            # Bypass the cache so the test always hits the real source
+            # Bypass the cache so the test always hits the real source, and read it
+            # with the enabled flag forced on without touching Tk from this thread.
             self._secondary_cache = None
-            was_enabled = self.secondary_source_enabled.get()
-            if not was_enabled:
-                self.secondary_source_enabled.set(True)
             try:
-                status, mod_time = self.read_secondary_source()
+                status, mod_time = self._read_secondary_values(True, source)
             finally:
-                if not was_enabled:
-                    self.secondary_source_enabled.set(False)
                 self._secondary_cache = None
 
             if status:
@@ -2123,8 +2306,15 @@ class RoofClassifierApp:
         check_interval = 60  # 60 seconds between checks
         
         while not self.stop_monitor:
-            # Check the latest PNG and update status
-            filename, status = self.classify_latest_png()
+            # Take a fresh configuration snapshot on the UI thread each cycle, so the
+            # worker never touches Tk variables but still sees setting changes.
+            config = self._request_monitor_config()
+            if config is None:
+                if self.logger:
+                    self.logger.error("Skipping monitoring cycle: no configuration available")
+                filename, status = None, "No configuration available"
+            else:
+                filename, status = self.classify_latest_png(config)
             self.root.after(0, lambda f=filename, s=status: self.update_monitoring_status(f, s))
 
             # Send notifications if configured (runs in background thread)
@@ -2463,14 +2653,18 @@ class RoofClassifierApp:
         detail_frame.rowconfigure(0, weight=1)
         detail_frame.columnconfigure(0, weight=1)
 
-    def _save_frame_for_review(self, img_path, reason):
+    def _save_frame_for_review(self, img_path, reason, config=None):
         """Copy *img_path* into the unclassified folder so it can be labelled later.
 
         *reason* is a short tag (e.g. 'toggle', 'disagree') prepended to the filename
         so the cause of capture is visible in the Classify Images window.
+        *config* is an optional snapshot from _get_monitor_config (see above).
         """
         try:
-            unclassified_folder = self._get_training_class_folder("unclassified")
+            if config is None:
+                config = self._get_monitor_config() or {}
+            unclassified_folder = self._get_training_class_folder(
+                "unclassified", config.get('training_data_folder', ''))
             os.makedirs(unclassified_folder, exist_ok=True)
             stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
             dest = os.path.join(unclassified_folder, f"{reason}_{stamp}_{os.path.basename(img_path)}")
@@ -2487,20 +2681,26 @@ class RoofClassifierApp:
             if self.logger:
                 self.logger.error(f"Error saving frame for review ({reason}): {e}")
 
-    def save_sample_if_needed(self, img_path):
-        """Randomly copy an image to the unclassified folder when sampling mode is active."""
-        if not self.sample_mode_enabled.get():
+    def save_sample_if_needed(self, img_path, config=None):
+        """Randomly copy an image to the unclassified folder when sampling mode is active.
+
+        *config* is an optional snapshot from _get_monitor_config (see above).
+        """
+        if config is None:
+            config = self._get_monitor_config() or {}
+        if not config.get('sample_mode_enabled'):
             return
         try:
-            rate = float(self.sample_rate.get())
-        except ValueError:
+            rate = float(config.get('sample_rate'))
+        except (TypeError, ValueError):
             return
         if not 0.0 <= rate <= 1.0:
             return
         if random.random() >= rate:
             return
         try:
-            unclassified_folder = self._get_training_class_folder("unclassified")
+            unclassified_folder = self._get_training_class_folder(
+                "unclassified", config.get('training_data_folder', ''))
             os.makedirs(unclassified_folder, exist_ok=True)
             dest = os.path.join(unclassified_folder, os.path.basename(img_path))
             base, ext = os.path.splitext(dest)
