@@ -8,7 +8,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import hashlib
 import json
 import logging
@@ -42,6 +42,15 @@ SETTINGS_FILE = "roof_classifier_settings.json"
 # Image display size constants
 _CLASSIFY_IMG_MAX_W = 820  # max width in the classify-images window (leaves room for button bar)
 _CLASSIFY_IMG_MAX_H = 460  # max height in the classify-images window
+_PREVIEW_IMG_MAX_W = 460   # max width of the latest-image preview on the Monitoring tab
+_PREVIEW_IMG_MAX_H = 260   # max height of the latest-image preview on the Monitoring tab
+
+# Manual override duration choices shown in the Monitoring tab dropdown
+OVERRIDE_DURATIONS = ["1 hour", "4 hours", "Until noon", "Until midnight", "Forever"]
+
+# How long a secondary roof status fetched over HTTP is reused before re-fetching.
+# Keeps the UI thread from issuing a network request on every status-label refresh.
+_SECONDARY_URL_CACHE_SECONDS = 30
 
 # Twilight angle presets (standard astronomical definitions)
 TWILIGHT_PRESETS = {
@@ -91,6 +100,24 @@ class RoofClassifierApp:
 
         # Camera URL for remote image source
         self.camera_url = tk.StringVar(value="")
+
+        # Manual override of the reported roof status.
+        # override_mode is the *staged* radio-button selection; the committed override
+        # lives in self.override_active / self.override_expiry.
+        self.override_mode = tk.StringVar(value="AUTO")          # AUTO | OPEN | CLOSED
+        self.override_duration = tk.StringVar(value="1 hour")
+        self.override_active = None      # None, "OPEN" or "CLOSED" — currently in force
+        self.override_expiry = None      # naive local datetime, or None for "Forever"
+
+        # Latest-image preview state (Monitoring tab)
+        self.preview_enabled = tk.BooleanVar(value=True)
+        self._preview_on = True          # plain-bool mirror, readable from the monitor thread
+        self._preview_tk_img = None      # keep a reference so Tk does not garbage-collect it
+        self._preview_tmp_path = None    # scaled PNG currently displayed
+        self._preview_busy = False       # guards manual refresh from stacking up
+
+        # Cached secondary roof status when the source is an HTTP URL
+        self._secondary_cache = None     # (source, status, mod_time, fetched_at) or None
 
         # Image hash tracking state
         self.last_image_hash = None
@@ -179,6 +206,29 @@ class RoofClassifierApp:
                     # Camera URL
                     self.camera_url.set(settings.get('camera_url', ''))
 
+                    # Latest-image preview
+                    self.preview_enabled.set(settings.get('preview_enabled', True))
+                    self._preview_on = self.preview_enabled.get()
+
+                    # Manual override — restored so an override survives a restart
+                    self.override_duration.set(settings.get('override_duration', '1 hour'))
+                    saved_override = settings.get('override_active') or None
+                    saved_expiry = settings.get('override_expiry') or None
+                    if saved_override in ("OPEN", "CLOSED"):
+                        expiry = None
+                        if saved_expiry:
+                            try:
+                                expiry = datetime.fromisoformat(saved_expiry)
+                            except ValueError:
+                                expiry = None
+                        # Drop an override that expired while the app was closed
+                        if expiry is not None and expiry <= datetime.now():
+                            saved_override = None
+                            expiry = None
+                        self.override_active = saved_override
+                        self.override_expiry = expiry
+                        self.override_mode.set(saved_override or "AUTO")
+
                     # Notification settings
                     self.notif_stale_enabled.set(settings.get('notif_stale_enabled', False))
                     self.notif_stale_minutes.set(settings.get('notif_stale_minutes', '10'))
@@ -221,6 +271,10 @@ class RoofClassifierApp:
                 'sample_rate': self.sample_rate.get(),
                 'validation_set_path': self.validation_set_path.get(),
                 'camera_url': self.camera_url.get(),
+                'preview_enabled': self.preview_enabled.get(),
+                'override_active': self.override_active or '',
+                'override_expiry': self.override_expiry.isoformat() if self.override_expiry else '',
+                'override_duration': self.override_duration.get(),
                 'notif_stale_enabled': self.notif_stale_enabled.get(),
                 'notif_stale_minutes': self.notif_stale_minutes.get(),
                 'notif_stale_url': self.notif_stale_url.get(),
@@ -491,46 +545,125 @@ class RoofClassifierApp:
                 self.logger.error(f"Error checking sun safety: {e}")
             return True  # Default to safe if calculation fails
 
+    @staticmethod
+    def _is_http_source(path):
+        """True if *path* points at an HTTP(S) resource rather than a local file."""
+        return path.strip().lower().startswith(("http://", "https://"))
+
+    @staticmethod
+    def _parse_secondary_status(text):
+        """Parse OPEN/CLOSED out of the last non-empty line of *text*.
+
+        Returns (status, last_line) where status is None if nothing could be parsed.
+        """
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if not lines:
+            return None, ""
+        last_line = lines[-1]
+        upper = last_line.upper()
+        if "OPEN" in upper:
+            return "OPEN", last_line
+        if "CLOSED" in upper:
+            return "CLOSED", last_line
+        return None, last_line
+
+    def _fetch_secondary_from_url(self, url):
+        """Fetch and parse the secondary roof status from an HTTP(S) URL.
+
+        Returns (status, mod_time) where mod_time comes from the Last-Modified header
+        when the server provides one, otherwise the time of the fetch. Raises on
+        network errors so the caller can log them.
+        """
+        req = urllib.request.Request(url, headers={"User-Agent": "SyntheticRoofStatus/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            raw = response.read()
+            last_modified = response.headers.get("Last-Modified")
+
+        text = raw.decode("utf-8", errors="replace")
+        status, last_line = self._parse_secondary_status(text)
+        if status is None:
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.warning(f"Could not parse status from secondary source URL: {last_line}")
+            return None, None
+
+        mod_time = None
+        if last_modified:
+            try:
+                from email.utils import parsedate_to_datetime
+                parsed = parsedate_to_datetime(last_modified)
+                # Normalise to a naive UTC datetime to match the local-file branch
+                if parsed.tzinfo is not None:
+                    parsed = parsed.astimezone(pytz.utc).replace(tzinfo=None)
+                mod_time = parsed
+            except Exception:
+                mod_time = None
+        if mod_time is None:
+            mod_time = datetime.utcnow()
+
+        return status, mod_time
+
     def read_secondary_source(self):
-        """Read the secondary source roof status file"""
+        """Read the secondary source roof status from a local file or an HTTP(S) URL.
+
+        Returns (status, mod_time_utc), or (None, None) when unavailable/unparseable.
+        URL results are cached briefly so repeated UI refreshes do not issue a network
+        request per call.
+        """
         if not self.secondary_source_enabled.get() or not self.secondary_source_path.get():
             return None, None
-        
+
+        source = self.secondary_source_path.get().strip()
+
+        if self._is_http_source(source):
+            # Serve from cache when it is still fresh and for the same URL
+            if self._secondary_cache:
+                cached_source, cached_status, cached_time, fetched_at = self._secondary_cache
+                if (cached_source == source
+                        and (datetime.utcnow() - fetched_at).total_seconds() < _SECONDARY_URL_CACHE_SECONDS):
+                    return cached_status, cached_time
+            try:
+                status, mod_time = self._fetch_secondary_from_url(source)
+                self._secondary_cache = (source, status, mod_time, datetime.utcnow())
+                if status and hasattr(self, 'logger') and self.logger:
+                    self.logger.info(f"Secondary source status: {status}, Last updated: {mod_time}")
+                return status, mod_time
+            except Exception as e:
+                if hasattr(self, 'logger') and self.logger:
+                    self.logger.error(f"Error reading secondary source URL {source}: {e}")
+                # Cache the failure too, so a dead URL does not stall every refresh
+                self._secondary_cache = (source, None, None, datetime.utcnow())
+                return None, None
+
         try:
-            file_path = self.secondary_source_path.get()
+            file_path = source
             if not os.path.exists(file_path):
                 if hasattr(self, 'logger') and self.logger:
                     self.logger.warning(f"Secondary source file not found: {file_path}")
                 return None, None
-            
+
             # Get file modification time in UTC
             mod_time = datetime.utcfromtimestamp(os.path.getmtime(file_path))
-            
+
             # Read the last line of the file
             with open(file_path, 'r') as f:
-                lines = f.readlines()
-                if not lines:
-                    if hasattr(self, 'logger') and self.logger:
-                        self.logger.warning(f"Secondary source file is empty: {file_path}")
-                    return None, None
-                
-                last_line = lines[-1].strip()
-                
-                # Try to parse the status from the line
-                if "OPEN" in last_line.upper():
-                    status = "OPEN"
-                elif "CLOSED" in last_line.upper():
-                    status = "CLOSED"
-                else:
-                    if hasattr(self, 'logger') and self.logger:
-                        self.logger.warning(f"Could not parse status from secondary source: {last_line}")
-                    return None, None
-                
+                content = f.read()
+
+            if not content.strip():
                 if hasattr(self, 'logger') and self.logger:
-                    self.logger.info(f"Secondary source status: {status}, Last updated: {mod_time}")
-                
-                return status, mod_time
-                
+                    self.logger.warning(f"Secondary source file is empty: {file_path}")
+                return None, None
+
+            status, last_line = self._parse_secondary_status(content)
+            if status is None:
+                if hasattr(self, 'logger') and self.logger:
+                    self.logger.warning(f"Could not parse status from secondary source: {last_line}")
+                return None, None
+
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.info(f"Secondary source status: {status}, Last updated: {mod_time}")
+
+            return status, mod_time
+
         except Exception as e:
             if hasattr(self, 'logger') and self.logger:
                 self.logger.error(f"Error reading secondary source: {e}")
@@ -701,6 +834,77 @@ class RoofClassifierApp:
                                          font=("Arial", 9))
         self.sun_status_label.pack()
 
+        # ── Manual override ───────────────────────────────────────────────────
+        override_frame = tk.LabelFrame(tab_monitor, text="Manual Override", padx=5, pady=5)
+        override_frame.pack(fill="x", padx=10, pady=5)
+
+        override_radio_frame = tk.Frame(override_frame)
+        override_radio_frame.pack(fill="x", pady=2)
+        tk.Radiobutton(override_radio_frame, text="Auto (use model)",
+                       variable=self.override_mode, value="AUTO").pack(side=tk.LEFT)
+        tk.Radiobutton(override_radio_frame, text="Force OPEN",
+                       variable=self.override_mode, value="OPEN").pack(side=tk.LEFT, padx=(10, 0))
+        tk.Radiobutton(override_radio_frame, text="Force CLOSED",
+                       variable=self.override_mode, value="CLOSED").pack(side=tk.LEFT, padx=(10, 0))
+
+        override_duration_frame = tk.Frame(override_frame)
+        override_duration_frame.pack(fill="x", pady=2)
+        tk.Label(override_duration_frame, text="Duration:").pack(side=tk.LEFT)
+        ttk.Combobox(override_duration_frame, textvariable=self.override_duration,
+                     values=OVERRIDE_DURATIONS, state="readonly",
+                     width=14).pack(side=tk.LEFT, padx=(5, 10))
+        tk.Button(override_duration_frame, text="Apply Override",
+                  command=self.apply_manual_override).pack(side=tk.LEFT, padx=2)
+        tk.Button(override_duration_frame, text="Clear Override",
+                  command=self.clear_manual_override).pack(side=tk.LEFT, padx=2)
+
+        self.override_status_label = tk.Label(override_frame,
+                                              text="No override — reporting model output",
+                                              fg="gray", font=("Arial", 9))
+        self.override_status_label.pack(anchor="w", pady=(2, 0))
+
+        tk.Label(override_frame,
+                 text=("Overrides the status written to the output file and reported to ASCOM "
+                       "clients.\nThe sun angle guard still vetoes the ASCOM 'IsSafe' flag, so a "
+                       "forced OPEN\nis not reported as safe while the sun is above the threshold."),
+                 fg="darkgreen", font=("Arial", 8), justify=tk.LEFT).pack(anchor="w")
+
+        # ── Latest image preview ──────────────────────────────────────────────
+        preview_frame = tk.LabelFrame(tab_monitor, text="Latest All-Sky Image", padx=5, pady=5)
+        preview_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+        tk.Checkbutton(preview_frame, text="Show preview",
+                       variable=self.preview_enabled,
+                       command=self.on_preview_enabled_changed).pack(anchor="w")
+
+        # Fixed-size holder so the panel does not jump around as images load
+        self.preview_holder = tk.Frame(preview_frame, bg="black",
+                                       width=_PREVIEW_IMG_MAX_W, height=_PREVIEW_IMG_MAX_H)
+        self.preview_holder.pack(pady=2)
+        self.preview_holder.pack_propagate(False)
+
+        self.preview_label = tk.Label(self.preview_holder, text="(no image loaded yet)",
+                                      fg="gray", bg="black")
+        self.preview_label.pack(fill="both", expand=True)
+
+        self.preview_bottom_frame = tk.Frame(preview_frame)
+        self.preview_bottom_frame.pack(fill="x", pady=2)
+        self.preview_caption_label = tk.Label(self.preview_bottom_frame, text="", fg="gray",
+                                              font=("Arial", 8), anchor="w")
+        self.preview_caption_label.pack(side=tk.LEFT, fill="x", expand=True)
+        tk.Button(self.preview_bottom_frame, text="Refresh",
+                  command=self.refresh_preview).pack(side=tk.RIGHT, padx=(5, 0))
+
+        if not self.preview_enabled.get():
+            self.preview_holder.pack_forget()
+            self.preview_bottom_frame.pack_forget()
+
+        # Keep the override countdown live, and populate the preview once at startup
+        self._update_override_display()
+        self.root.after(1000, self._tick_override_display)
+        if self.preview_enabled.get():
+            self.root.after(1200, self.refresh_preview)
+
         # ── Tab 3: Configuration ──────────────────────────────────────────────
         tab_config = ttk.Frame(notebook)
         notebook.add(tab_config, text="Configuration")
@@ -764,18 +968,24 @@ class RoofClassifierApp:
         # Update window display after GUI is set up
         self.root.after(1000, self.update_observation_window_display)
 
-        # Secondary source
-        secondary_frame = tk.Frame(config_frame)
-        secondary_frame.pack(fill="x", pady=2)
+        # Secondary source — either a local file path or an HTTP(S) URL
+        secondary_outer = tk.Frame(config_frame)
+        secondary_outer.pack(fill="x", pady=2)
 
-        secondary_checkbox = tk.Checkbutton(secondary_frame, text="Monitor Secondary Roof Status File",
+        secondary_checkbox = tk.Checkbutton(secondary_outer,
+                                          text="Monitor Secondary Roof Status File or URL",
                                           variable=self.secondary_source_enabled)
-        secondary_checkbox.pack(side=tk.LEFT)
+        secondary_checkbox.pack(anchor="w")
 
-        secondary_path_frame = tk.Frame(secondary_frame)
-        secondary_path_frame.pack(side=tk.RIGHT, fill="x", expand=True, padx=(10,0))
+        secondary_path_frame = tk.Frame(secondary_outer)
+        secondary_path_frame.pack(fill="x", padx=(20, 0))
         tk.Entry(secondary_path_frame, textvariable=self.secondary_source_path, width=30).pack(side=tk.LEFT, fill="x", expand=True)
+        tk.Button(secondary_path_frame, text="Test", command=self._test_secondary_source).pack(side=tk.RIGHT, padx=(5,0))
         tk.Button(secondary_path_frame, text="Browse...", command=self.browse_secondary_source).pack(side=tk.RIGHT, padx=(5,0))
+
+        tk.Label(secondary_outer,
+                 text="Accepts a local file path or an http(s):// URL. The last line must contain OPEN or CLOSED.",
+                 fg="darkgreen", font=("Arial", 8)).pack(anchor="w", padx=(20, 0))
 
         # ASCOM Alpaca configuration section
         if FLASK_AVAILABLE:
@@ -1180,35 +1390,20 @@ class RoofClassifierApp:
                 self.logger.error("No model loaded")
             return None, "No model loaded"
 
-        camera_url = self.camera_url.get().strip()
-        tmp_path = None
+        img_path, latest, is_temp, error = self._resolve_latest_image()
+        if img_path is None:
+            if self.logger:
+                self.logger.error(f"Could not obtain an image to classify: {error}")
+            return None, error
 
-        if camera_url:
-            # URL mode: download the latest image from the configured URL
-            tmp_path = self._fetch_image_from_url(camera_url)
-            if tmp_path is None:
-                return None, "Failed to fetch image from URL"
-            img_path = tmp_path
-            latest = camera_url
-        else:
-            # Folder mode: find the newest image in the monitor folder
-            folder = self.monitor_path.get()
-            if not os.path.isdir(folder):
-                if self.logger:
-                    self.logger.error("No model loaded or invalid monitor folder")
-                return None, "No model or invalid folder"
+        tmp_path = img_path if is_temp else None
 
-            images = [f for f in os.listdir(folder) if f.lower().endswith((".png", ".jpg", ".jpeg"))]
-            if not images:
-                if self.logger:
-                    self.logger.warning("No image files found in monitor folder")
-                return None, "No image files found"
-
-            latest = max(images, key=lambda f: os.path.getmtime(os.path.join(folder, f)))
-            img_path = os.path.join(folder, latest)
-
+        if not is_temp:
             # Optionally save a random sample for manual classification
             self.save_sample_if_needed(img_path)
+
+        # Show the frame we are about to classify on the Monitoring tab
+        self._capture_preview(img_path, latest)
 
         # Track image file hash to detect when a new image arrives
         try:
@@ -1239,7 +1434,19 @@ class RoofClassifierApp:
         else:
             final_status = image_status
             override_reason = ""
-        
+
+        # Apply the manual override last — it wins over both the model and the sun guard
+        # for the reported roof status. (The ASCOM IsSafe flag keeps its own sun check.)
+        manual_override = self.get_manual_override()
+        if manual_override:
+            if manual_override != final_status and self.logger:
+                self.logger.warning(
+                    f"MANUAL OVERRIDE: reporting {manual_override} instead of {final_status} "
+                    f"(model said {image_status})"
+                )
+            final_status = manual_override
+            override_reason = f" (Manual override: {manual_override})"
+
         # Log the analysis
         now = datetime.now().strftime("%Y-%m-%d %I:%M:%S%p")
         sun_angle = self.calculate_sun_angle()
@@ -1275,7 +1482,9 @@ class RoofClassifierApp:
         # ── State toggle capture ──────────────────────────────────────────────
         # When the reported status flips, save the frame so a wrongly-classified
         # transition can be reviewed/labelled later.
+        # A flip caused by a manual override says nothing about the model, so skip it.
         if (self.save_on_toggle_enabled.get()
+                and not manual_override
                 and self.previous_classified_status is not None
                 and final_status != self.previous_classified_status):
             self._save_frame_for_review(img_path, "toggle")
@@ -1529,6 +1738,324 @@ class RoofClassifierApp:
                 text=f"⚠ Sun altitude: {sun_angle:.1f}° (UNSAFE — above {threshold:.1f}° threshold)",
                 fg="darkorange",
             )
+
+    # ── Manual override of the reported roof status ───────────────────────────
+
+    def _compute_override_expiry(self, duration_label):
+        """Return the local (naive) expiry time for *duration_label*, or None for 'Forever'."""
+        now = datetime.now()
+        if duration_label == "1 hour":
+            return now + timedelta(hours=1)
+        if duration_label == "4 hours":
+            return now + timedelta(hours=4)
+        if duration_label == "Until noon":
+            noon = now.replace(hour=12, minute=0, second=0, microsecond=0)
+            if noon <= now:
+                noon += timedelta(days=1)
+            return noon
+        if duration_label == "Until midnight":
+            return (now.replace(hour=0, minute=0, second=0, microsecond=0)
+                    + timedelta(days=1))
+        return None  # "Forever"
+
+    def get_manual_override(self):
+        """Return "OPEN"/"CLOSED" while a manual override is in force, else None.
+
+        An expired override is cleared as a side effect. Safe to call from the monitor
+        thread: all Tk widget work is deferred to the UI thread.
+        """
+        if self.override_active is None:
+            return None
+        if self.override_expiry is not None and datetime.now() >= self.override_expiry:
+            expired = self.override_active
+            self.override_active = None
+            self.override_expiry = None
+            self.save_settings()
+            if self.logger:
+                self.logger.info(f"Manual override ({expired}) expired — reverting to model output")
+            try:
+                self.root.after(0, self._sync_override_ui)
+            except Exception:
+                pass
+            return None
+        return self.override_active
+
+    def _sync_override_ui(self):
+        """Bring the override radio buttons and label back in line with the committed
+        override state (UI thread only)."""
+        self.override_mode.set(self.override_active or "AUTO")
+        self._update_override_display()
+
+    def apply_manual_override(self):
+        """Commit the staged radio-button selection as the active override."""
+        mode = self.override_mode.get()
+        if mode == "AUTO":
+            self.clear_manual_override()
+            return
+
+        duration = self.override_duration.get()
+        self.override_active = mode
+        self.override_expiry = self._compute_override_expiry(duration)
+        self.save_settings()
+
+        until = self.override_expiry.strftime("%Y-%m-%d %H:%M local") if self.override_expiry else "forever"
+        if self.logger:
+            self.logger.warning(f"MANUAL OVERRIDE APPLIED: reporting {mode} until {until}")
+        self._update_override_display()
+        messagebox.showinfo(
+            "Manual Override Active",
+            f"Roof status will be reported as {mode} until {until}.\n\n"
+            "This applies to the status file and to ASCOM clients.\n\n"
+            "Note: the sun angle guard still applies to the ASCOM 'IsSafe' flag, so a\n"
+            "forced OPEN will not be reported as safe while the sun is above the\n"
+            "configured threshold."
+        )
+
+    def clear_manual_override(self):
+        """Drop any active override and return to model-driven status."""
+        was = self.override_active
+        self.override_active = None
+        self.override_expiry = None
+        self.override_mode.set("AUTO")
+        self.save_settings()
+        if was and self.logger:
+            self.logger.warning(f"Manual override ({was}) cleared — reverting to model output")
+        self._update_override_display()
+
+    def _format_override_remaining(self):
+        """Human-readable time left on the current override."""
+        if self.override_expiry is None:
+            return "no expiry"
+        remaining = (self.override_expiry - datetime.now()).total_seconds()
+        if remaining <= 0:
+            return "expiring"
+        hours, rem = divmod(int(remaining), 3600)
+        minutes, seconds = divmod(rem, 60)
+        if hours:
+            return f"{hours}h {minutes}m left"
+        if minutes:
+            return f"{minutes}m {seconds}s left"
+        return f"{seconds}s left"
+
+    def _update_override_display(self):
+        """Refresh the Monitoring-tab override status label."""
+        if not hasattr(self, "override_status_label"):
+            return
+        if self.override_active is None:
+            self.override_status_label.config(
+                text="No override — reporting model output", fg="gray"
+            )
+            return
+
+        if self.override_expiry is None:
+            detail = "until cleared"
+        else:
+            detail = (f"until {self.override_expiry.strftime('%Y-%m-%d %H:%M')} local "
+                      f"({self._format_override_remaining()})")
+        self.override_status_label.config(
+            text=f"⚠ OVERRIDE ACTIVE — reporting {self.override_active} {detail}",
+            fg="darkorange",
+        )
+
+    def _tick_override_display(self):
+        """Periodic refresh so the override countdown stays live and expiry is noticed
+        even when monitoring is not running."""
+        try:
+            self.get_manual_override()  # clears the override if it has expired
+            self._update_override_display()
+        finally:
+            try:
+                self.root.after(1000, self._tick_override_display)
+            except Exception:
+                pass  # window is closing
+
+    # ── Latest-image preview (Monitoring tab) ─────────────────────────────────
+
+    def _resolve_latest_image(self, camera_url=None, folder=None):
+        """Locate the newest image to classify or preview.
+
+        Returns (path, caption, is_temp, error). *path* is None when no image is
+        available, in which case *error* describes why. When *is_temp* is True the
+        caller owns the temporary file and must delete it.
+
+        *camera_url* and *folder* may be supplied by a caller that already read them
+        on the UI thread; otherwise they are read from the Tk variables here.
+        """
+        camera_url = (self.camera_url.get() if camera_url is None else camera_url).strip()
+        if camera_url:
+            tmp_path = self._fetch_image_from_url(camera_url)
+            if tmp_path is None:
+                return None, None, False, "Failed to fetch image from URL"
+            return tmp_path, camera_url, True, None
+
+        folder = self.monitor_path.get() if folder is None else folder
+        if not os.path.isdir(folder):
+            return None, None, False, "No model or invalid folder"
+
+        images = [f for f in os.listdir(folder) if f.lower().endswith((".png", ".jpg", ".jpeg"))]
+        if not images:
+            return None, None, False, "No image files found"
+
+        latest = max(images, key=lambda f: os.path.getmtime(os.path.join(folder, f)))
+        return os.path.join(folder, latest), latest, False, None
+
+    def on_preview_enabled_changed(self):
+        """Show or hide the preview panel (and stop doing the work when hidden)."""
+        self._preview_on = self.preview_enabled.get()
+        if self._preview_on:
+            self.preview_holder.pack(pady=2)
+            self.preview_bottom_frame.pack(fill="x", pady=2)
+            self.refresh_preview()
+        else:
+            self.preview_holder.pack_forget()
+            self.preview_bottom_frame.pack_forget()
+        self.save_settings()
+
+    def _capture_preview(self, img_path, caption):
+        """Scale *img_path* for the Monitoring-tab preview and hand it to the UI thread.
+
+        Safe to call from the monitor thread — the OpenCV work happens here and all Tk
+        work is deferred with root.after.
+        """
+        # _preview_on mirrors the checkbox as a plain bool: this runs on the monitor
+        # thread, which must not touch Tk variables.
+        if not hasattr(self, "preview_label") or not self._preview_on:
+            return
+        tmp_path = None
+        try:
+            img = cv2.imread(img_path)
+            if img is None:
+                return
+            h, w = img.shape[:2]
+            scale = min(_PREVIEW_IMG_MAX_W / w, _PREVIEW_IMG_MAX_H / h, 1.0)
+            disp = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))))
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".png")
+            os.close(tmp_fd)
+            cv2.imwrite(tmp_path, disp)
+        except Exception as e:
+            if self.logger:
+                self.logger.warning(f"Could not build preview image for {img_path}: {e}")
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+            return
+
+        try:
+            self.root.after(0, self._apply_preview, tmp_path, caption)
+        except Exception:
+            # The window is going away — drop the prepared image
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    def _apply_preview(self, tmp_path, caption):
+        """Display a prepared preview image (UI thread only)."""
+        if not hasattr(self, "preview_label"):
+            return
+        try:
+            tk_img = tk.PhotoImage(file=tmp_path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            return
+
+        previous = self._preview_tmp_path
+        self._preview_tk_img = tk_img          # keep a reference alive for Tk
+        self._preview_tmp_path = tmp_path
+        # width/height are character cells for a text label but pixels for an image
+        # label, so they must be restated in pixels or the image is clipped.
+        self.preview_label.config(image=tk_img, text="", bg="black",
+                                  width=tk_img.width(), height=tk_img.height())
+        self.preview_caption_label.config(
+            text=f"{caption}  —  {datetime.now().strftime('%H:%M:%S')}", fg="darkgreen"
+        )
+
+        if previous and previous != tmp_path:
+            try:
+                os.unlink(previous)
+            except OSError:
+                pass
+
+    def refresh_preview(self):
+        """Fetch and display the latest image on demand (button handler)."""
+        if self._preview_busy:
+            return
+        self._preview_busy = True
+        self.preview_caption_label.config(text="Loading latest image...", fg="gray")
+
+        # Read the Tk variables here, on the UI thread, and hand the plain strings to
+        # the worker — Tk variables must not be touched from another thread.
+        camera_url = self.camera_url.get()
+        folder = self.monitor_path.get()
+
+        def do_refresh():
+            try:
+                img_path, caption, is_temp, error = self._resolve_latest_image(camera_url, folder)
+                if img_path is None:
+                    try:
+                        self.root.after(
+                            0,
+                            lambda: self.preview_caption_label.config(
+                                text=f"Preview unavailable: {error}", fg="red"
+                            ),
+                        )
+                    except Exception:
+                        pass
+                    return
+                try:
+                    self._capture_preview(img_path, caption)
+                finally:
+                    if is_temp:
+                        try:
+                            os.unlink(img_path)
+                        except OSError:
+                            pass
+            finally:
+                self._preview_busy = False
+
+        threading.Thread(target=do_refresh, daemon=True).start()
+
+    def _test_secondary_source(self):
+        """Test reading the configured secondary roof status file or URL."""
+        source = self.secondary_source_path.get().strip()
+        if not source:
+            messagebox.showwarning("No Source", "Please enter a secondary roof status file path or URL first.")
+            return
+
+        def do_test():
+            # Bypass the cache so the test always hits the real source
+            self._secondary_cache = None
+            was_enabled = self.secondary_source_enabled.get()
+            if not was_enabled:
+                self.secondary_source_enabled.set(True)
+            try:
+                status, mod_time = self.read_secondary_source()
+            finally:
+                if not was_enabled:
+                    self.secondary_source_enabled.set(False)
+                self._secondary_cache = None
+
+            if status:
+                time_str = mod_time.strftime("%Y-%m-%d %H:%M:%S UTC") if mod_time else "unknown"
+                msg = f"Read status: {status}\nLast updated: {time_str}\n\nSource: {source}"
+                self.root.after(0, lambda m=msg: messagebox.showinfo("Secondary Source OK", m))
+            else:
+                self.root.after(
+                    0,
+                    lambda: messagebox.showerror(
+                        "Secondary Source Failed",
+                        f"Could not read an OPEN/CLOSED status from:\n{source}\n\n"
+                        "Check the path/URL and that the last line contains OPEN or CLOSED.\n"
+                        "Enable logging for the detailed error.",
+                    ),
+                )
+
+        threading.Thread(target=do_test, daemon=True).start()
 
     def _test_camera_url(self):
         """Test downloading an image from the configured camera URL."""
@@ -2586,7 +3113,11 @@ class RoofClassifierApp:
     def browse_secondary_source(self):
         """Browse for secondary source roof status file"""
         current_path = self.secondary_source_path.get()
-        initial_dir = os.path.dirname(current_path) if current_path else os.getcwd()
+        # A URL has no meaningful parent directory to start the dialog in
+        if current_path and not self._is_http_source(current_path):
+            initial_dir = os.path.dirname(current_path)
+        else:
+            initial_dir = os.getcwd()
         path = filedialog.askopenfilename(
             title="Select Secondary Roof Status File",
             filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
@@ -2594,6 +3125,7 @@ class RoofClassifierApp:
         )
         if path:
             self.secondary_source_path.set(path)
+            self._secondary_cache = None
             self.save_settings()
 
     def calculate_next_observation_window(self):
