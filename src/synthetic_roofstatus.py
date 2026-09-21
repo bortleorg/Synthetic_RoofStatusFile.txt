@@ -1835,7 +1835,14 @@ class RoofClassifierApp:
             else:
                 self.statusbar_label.config(text=f"● Monitoring: Active — {status}", fg="green")
         else:
-            self.status_label.config(text="Monitoring: Error checking files", fg="red")
+            # *status* carries the reason the pass failed; show it rather than a
+            # generic error, so a dead camera URL, an unreadable frame and a
+            # missing folder can be told apart without opening the log.
+            reason = status or "Error checking files"
+            text = f"Monitoring: {reason}"
+            if self._failsafe_active:
+                text += " — status file set to CLOSED (fail-safe)"
+            self.status_label.config(text=text, fg="red")
             self.statusbar_label.config(text="● Monitoring: Active — Error", fg="red")
 
     def update_countdown(self, seconds_remaining):

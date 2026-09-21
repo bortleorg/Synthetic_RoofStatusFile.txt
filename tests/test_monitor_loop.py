@@ -252,3 +252,44 @@ def test_countdown_reports_whole_seconds_down_to_one(looper, monkeypatch):
     assert all(isinstance(r, int) for r in shown)
     assert shown[0] == 3 and shown[-1] == 1
     assert shown == sorted(shown, reverse=True)
+
+
+# ── what the Monitoring tab shows for a failed pass ───────────────────────────
+
+class FakeLabel:
+    def __init__(self):
+        self.text = None
+        self.fg = None
+
+    def config(self, text=None, fg=None, **_kwargs):
+        self.text, self.fg = text, fg
+
+
+@pytest.fixture
+def display(app):
+    app.status_label = FakeLabel()
+    app.statusbar_label = FakeLabel()
+    app._failsafe_active = False
+    return app
+
+
+def test_failed_pass_shows_its_reason(display):
+    display.update_monitoring_status(None, "Could not read image frame.png")
+
+    assert "Could not read image frame.png" in display.status_label.text
+    assert display.status_label.fg == "red"
+
+
+def test_failed_pass_mentions_an_active_failsafe(display):
+    display._failsafe_active = True
+
+    display.update_monitoring_status(None, "Failed to fetch image from URL")
+
+    assert "Failed to fetch image from URL" in display.status_label.text
+    assert "fail-safe" in display.status_label.text
+
+
+def test_failed_pass_without_a_reason_falls_back_to_a_generic_message(display):
+    display.update_monitoring_status(None, None)
+
+    assert display.status_label.text == "Monitoring: Error checking files"
