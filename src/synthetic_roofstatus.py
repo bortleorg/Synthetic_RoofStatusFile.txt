@@ -527,7 +527,8 @@ class RoofClassifierApp:
             
             # Start server in a separate thread
             server_thread = threading.Thread(
-                target=self.ascom_server.run,
+                target=self._serve_ascom,
+                args=(self.ascom_server, silent),
                 daemon=True
             )
             server_thread.start()
@@ -548,6 +549,38 @@ class RoofClassifierApp:
                 messagebox.showerror("ASCOM Server Error", f"Could not start the ASCOM server: {e}")
             elif self.logger:
                 self.logger.error(f"Failed to auto-start ASCOM server: {e}")
+
+    def _serve_ascom(self, server, silent):
+        """Run *server* on this (worker) thread and report it if it dies.
+
+        The port is only bound here, after start_ascom_server has returned, so a
+        port already in use surfaces now. Werkzeug reports it with sys.exit(1),
+        hence BaseException. Without this the UI kept showing the server as
+        running with nothing listening.
+        """
+        try:
+            server.run()
+        except BaseException as e:
+            reason = "the port is probably in use" if isinstance(e, SystemExit) else str(e)
+            self._defer_to_ui(lambda: self._on_ascom_server_failed(server, reason, silent))
+
+    def _on_ascom_server_failed(self, server, reason, silent):
+        """Clear the state of a server that failed after starting (UI thread only)."""
+        if self.ascom_server is not server:
+            return  # already stopped or replaced
+        try:
+            server.stop()
+        except Exception:
+            pass
+        self.ascom_server = None
+        self.ascom_enabled.set(False)
+        self._update_ascom_display()
+        message = f"The ASCOM server on port {server.port} stopped: {reason}."
+        if self.logger:
+            self.logger.error(message)
+        if not silent:
+            messagebox.showerror("ASCOM Server Error",
+                                 message + "\n\nChoose another port and start the server again.")
 
     def stop_ascom_server(self):
         """Stop the ASCOM Alpaca server"""
