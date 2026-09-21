@@ -50,9 +50,9 @@ A frame that cannot be read (for example because the camera is still writing it)
 
 The Monitoring tab also shows **"Image last changed: X min ago"** — the elapsed time since the image hash last changed. This turns orange when the image has not changed for longer than the stale threshold (configured in the Notifications tab). The status bar additionally shows a `⚠ stale image` warning in orange when the image is stale.
 
-By default a stale image is also not trusted for the roof status. A hung camera, a URL serving a cached frame, or capture software that stopped writing hands the classifier the same frame on every pass, and that frame would otherwise be reported (possibly as `OPEN`) all night. Once the image has not changed for the stale threshold, the output file reports `Roof Status: CLOSED (Image unchanged for N min - failsafe)` and ASCOM clients see `CLOSED`, whether or not the stale notification is enabled. A manual override still wins, and the normal status returns with the next new frame.
+By default a stale image is still classified and reported as usual. A hung camera, a URL serving a cached frame, or capture software that stopped writing hands the classifier the same frame on every pass, so that frame's status (possibly `OPEN`) keeps being reported for as long as the feed stays frozen.
 
-To keep reporting the model's classification of the frozen frame instead, choose **"While the image is stale, report: The model's classification of the last frame"** in the Stale Image section of the Notifications tab. The stale threshold set there controls when the image counts as stale, for both the notification and this fail-safe.
+To fail safe instead, choose **"While the image is stale, report: CLOSED (fail-safe)"** in the Stale Image section of the Notifications tab. Then, once the image has not changed for the stale threshold, the output file reports `Roof Status: CLOSED (Image unchanged for N min - failsafe)` and ASCOM clients see `CLOSED`, whether or not the stale notification is enabled. A manual override still wins, and the normal status returns with the next new frame. The stale threshold set there controls when the image counts as stale, for both the notification and this fail-safe.
 
 #### Latest All-Sky Image preview
 
@@ -108,7 +108,7 @@ Webhooks are HTTP POST requests with a JSON body. The `event` field identifies t
 
 | Section | `event` value | Trigger condition |
 |---|---|---|
-| Stale Image | `image_stale` | Image hash unchanged for ≥ stale threshold; re-fires every threshold interval while still stale. With the default fail-safe, the reported status is also forced to CLOSED at that point (see Monitoring), so a `roof_closed` event may accompany it |
+| Stale Image | `image_stale` | Image hash unchanged for ≥ stale threshold; re-fires every threshold interval while still stale. With the stale fail-safe enabled, the reported status is also forced to CLOSED at that point (see Monitoring), so a `roof_closed` event may accompany it |
 | Roof Open | `roof_open` | Status transitions to OPEN (not sent on every cycle) |
 | Roof Closed | `roof_closed` | Status transitions to CLOSED (not sent on every cycle) |
 | Heartbeat | `heartbeat` | Every X minutes while monitoring is active **and** the image is not stale |
@@ -116,7 +116,7 @@ Webhooks are HTTP POST requests with a JSON body. The `event` field identifies t
 **Stale Image** — Set the stale threshold in minutes (default: 10). If the image hash has not changed for that long, the image counts as stale:
 
 - If the notification is enabled, a webhook fires. It re-fires once per threshold interval for as long as the image remains unchanged.
-- **"While the image is stale, report"** chooses the reported roof status: **CLOSED (fail-safe)** (the default) or **the model's classification of the last frame**. This applies whether or not the notification is enabled.
+- **"While the image is stale, report"** chooses the reported roof status: **the model's classification of the last frame** (the default) or **CLOSED (fail-safe)**. This applies whether or not the notification is enabled.
 
 **Roof Open / Closed Notifications** — Fire once each time the status transitions to OPEN or CLOSED, respectively.
 
@@ -185,6 +185,6 @@ and the executable is only built if it passes.
 - Images should be reasonably consistent in angle and framing.
 - Works best when lighting or exposure is fairly stable across captures.
 - Settings (model path, folder paths, location, thresholds, etc.) are saved automatically to `roof_classifier_settings.json` in the working directory and restored on the next launch. Both this file and the roof status file are written atomically, so a crash or a reader polling the file cannot leave either one half-written. A settings file that is unreadable anyway is moved aside to `roof_classifier_settings.json.corrupt` and defaults are used.
-- Safety decisions fail closed. If the sun altitude cannot be calculated, or the last roof classification is more than three minutes old, the ASCOM `IsSafe` flag reports unsafe rather than assuming the best. The roof status file follows suit after three minutes without a valid classification, and reports `CLOSED` as soon as the camera image has stopped changing for the stale threshold.
+- Safety decisions fail closed. If the sun altitude cannot be calculated, or the last roof classification is more than three minutes old, the ASCOM `IsSafe` flag reports unsafe rather than assuming the best. The roof status file follows suit after three minutes without a valid classification, and, if the stale fail-safe is enabled, reports `CLOSED` as soon as the camera image has stopped changing for the stale threshold.
 - A model file is checked when it is loaded: one trained at a different image size, or a file that is not a classifier, is rejected with a message instead of failing every monitoring pass. Training requires both open and closed examples.
 - A secondary roof status file is parsed on whole words. A line such as `roof is not open` is treated as unreadable rather than as `OPEN`, and a line mentioning both states is read as `CLOSED`.

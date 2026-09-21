@@ -85,11 +85,12 @@ FAILSAFE_AFTER_SECONDS = CLASSIFICATION_MAX_AGE_SECONDS
 # CLOSED rather than trusted.
 DEFAULT_STALE_MINUTES = 10.0
 
-# What to report while the image is stale: CLOSED (fail-safe), or keep reporting
-# whatever the model makes of the frozen frame.
+# What to report while the image is stale: keep reporting whatever the model
+# makes of the frozen frame (the default), or CLOSED as a fail-safe.
 STALE_ACTION_CLOSED = "closed"
 STALE_ACTION_KEEP = "keep"
 STALE_ACTIONS = (STALE_ACTION_CLOSED, STALE_ACTION_KEEP)
+DEFAULT_STALE_ACTION = STALE_ACTION_KEEP
 
 # How long a secondary roof status fetched over HTTP is reused before re-fetching.
 # Keeps the UI thread from issuing a network request on every status-label refresh.
@@ -189,7 +190,7 @@ class RoofClassifierApp:
         self.notif_stale_enabled = tk.BooleanVar(value=False)
         self.notif_stale_minutes = tk.StringVar(value="10")
         self.notif_stale_url = tk.StringVar(value="")
-        self.stale_image_action = tk.StringVar(value=STALE_ACTION_CLOSED)
+        self.stale_image_action = tk.StringVar(value=DEFAULT_STALE_ACTION)
         self.notif_open_enabled = tk.BooleanVar(value=False)
         self.notif_open_url = tk.StringVar(value="")
         self.notif_closed_enabled = tk.BooleanVar(value=False)
@@ -305,10 +306,9 @@ class RoofClassifierApp:
                 self.notif_stale_enabled.set(settings.get('notif_stale_enabled', False))
                 self.notif_stale_minutes.set(settings.get('notif_stale_minutes', '10'))
                 self.notif_stale_url.set(settings.get('notif_stale_url', ''))
-                stale_action = settings.get('stale_image_action', STALE_ACTION_CLOSED)
-                # Anything unrecognised falls back to the fail-safe choice.
+                stale_action = settings.get('stale_image_action', DEFAULT_STALE_ACTION)
                 self.stale_image_action.set(
-                    stale_action if stale_action in STALE_ACTIONS else STALE_ACTION_CLOSED)
+                    stale_action if stale_action in STALE_ACTIONS else DEFAULT_STALE_ACTION)
                 self.notif_open_enabled.set(settings.get('notif_open_enabled', False))
                 self.notif_open_url.set(settings.get('notif_open_url', ''))
                 self.notif_closed_enabled.set(settings.get('notif_closed_enabled', False))
@@ -1268,12 +1268,12 @@ class RoofClassifierApp:
         tk.Label(stale_action_frame,
                  text="While the image is stale (camera frozen), report:").pack(anchor="w")
         tk.Radiobutton(stale_action_frame,
-                       text="CLOSED (fail-safe) — don't trust a frozen frame",
-                       variable=self.stale_image_action, value=STALE_ACTION_CLOSED,
-                       command=self.save_settings).pack(anchor="w", padx=(15, 0))
-        tk.Radiobutton(stale_action_frame,
                        text="The model's classification of the last frame",
                        variable=self.stale_image_action, value=STALE_ACTION_KEEP,
+                       command=self.save_settings).pack(anchor="w", padx=(15, 0))
+        tk.Radiobutton(stale_action_frame,
+                       text="CLOSED (fail-safe) — don't trust a frozen frame",
+                       variable=self.stale_image_action, value=STALE_ACTION_CLOSED,
                        command=self.save_settings).pack(anchor="w", padx=(15, 0))
 
         stale_url_outer = tk.Frame(stale_frame)
@@ -1791,8 +1791,8 @@ class RoofClassifierApp:
         # A frozen feed (camera hung, URL serving a cached frame, capture software
         # stopped writing) still classifies cleanly - the same frame, every pass - so
         # none of the failure paths fire, and an OPEN frame would be reported all
-        # night. Once the image has not changed for the stale threshold, report
-        # CLOSED instead - unless the user chose to keep trusting the frozen frame.
+        # night. When the user opts in, report CLOSED once the image has not
+        # changed for the stale threshold.
         # Applied after model_status so the toggle baseline stays the model's view,
         # and before the override, which still wins.
         stale_minutes = self._image_unchanged_minutes()
@@ -2109,9 +2109,9 @@ class RoofClassifierApp:
 
     @staticmethod
     def _stale_failsafe_enabled(config):
-        """True unless the user chose to keep reporting the model's view of a stale
-        frame. Missing or unrecognised values fail safe."""
-        return config.get('stale_image_action', STALE_ACTION_CLOSED) != STALE_ACTION_KEEP
+        """True only when the user opted into reporting CLOSED for a stale frame.
+        Missing or unrecognised values mean the default: keep the model's view."""
+        return config.get('stale_image_action', DEFAULT_STALE_ACTION) == STALE_ACTION_CLOSED
 
     def _image_unchanged_minutes(self, now=None):
         """Minutes since the image hash last changed, or None before the first frame."""

@@ -3,8 +3,9 @@
 A hung camera, a URL serving a cached frame, or capture software that stopped
 writing all hand the classifier the same frame every pass. That classifies
 cleanly, so none of the failure paths fired and an OPEN frame was reported all
-night. Once the image has not changed for the stale threshold, the status is
-reported CLOSED.
+night. With the fail-safe setting on, once the image has not changed for the
+stale threshold the status is reported CLOSED. By default the model's view of
+the frozen frame is still reported.
 """
 
 import threading
@@ -47,6 +48,8 @@ def pipeline(app, tmp_path):
         'output_path': str(tmp_path / "status.txt"),
         'save_on_disagreement': False, 'save_on_toggle': False,
         'notif_stale_minutes': '10',
+        # The fail-safe is opt-in; most tests here exercise it.
+        'stale_image_action': srs.STALE_ACTION_CLOSED,
     }
     return app
 
@@ -169,9 +172,22 @@ def test_closed_setting_is_the_failsafe(pipeline):
     assert classify(pipeline)[1] == "CLOSED"
 
 
+def test_default_reports_the_frozen_frame_as_classified(pipeline):
+    """The fail-safe is opt-in: with no setting the model's view is reported."""
+    del pipeline.config['stale_image_action']
+    classify(pipeline)
+    freeze_for(pipeline, 60)
+
+    assert classify(pipeline)[1] == "OPEN"
+
+
+def test_default_action_is_keep():
+    assert srs.DEFAULT_STALE_ACTION == srs.STALE_ACTION_KEEP
+
+
 @pytest.mark.parametrize("config", [{}, {'stale_image_action': ''}, {'stale_image_action': 'bogus'}])
-def test_missing_or_unknown_setting_fails_safe(config):
-    assert srs.RoofClassifierApp._stale_failsafe_enabled(config) is True
+def test_missing_or_unknown_setting_uses_the_default(config):
+    assert srs.RoofClassifierApp._stale_failsafe_enabled(config) is False
 
 
 def test_keep_setting_does_not_silence_the_stale_notification(app):
