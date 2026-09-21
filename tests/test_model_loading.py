@@ -91,6 +91,44 @@ def test_failed_save_keeps_the_trained_model(trainer, tmp_path, dialogs):
     assert "could not save" in dialogs["info"][0]
 
 
+def test_clean_training_run_opens_no_dialog(trainer, tmp_path, dialogs):
+    """A saved, complete run is reported in the status bar; dialogs are for problems."""
+    add_images(tmp_path / "train", "open", 3, 200)
+    add_images(tmp_path / "train", "closed", 3, 20)
+    trainer.model_path = Var(str(tmp_path / "m.joblib"))
+
+    trainer.train_model()
+
+    assert os.path.isfile(tmp_path / "m.joblib")
+    assert dialogs == {"error": [], "info": []}
+
+
+def test_unsaved_training_run_says_so(trainer, tmp_path, dialogs):
+    add_images(tmp_path / "train", "open", 3, 200)
+    add_images(tmp_path / "train", "closed", 3, 20)
+
+    trainer.train_model()
+
+    assert "not been saved" in dialogs["info"][0]
+
+
+# ── saving ────────────────────────────────────────────────────────────────────
+
+def test_save_as_makes_the_new_file_the_current_model(trainer, tmp_path, dialogs, monkeypatch):
+    """Otherwise the next training run saved over the old file, and a model never
+    saved before kept showing as unsaved."""
+    target = tmp_path / "saved.joblib"
+    monkeypatch.setattr(srs.filedialog, "asksaveasfilename", lambda **k: str(target))
+    trainer.model = fit_model(srs.IMG_SIZE * srs.IMG_SIZE)
+    trainer.model_path = Var(str(tmp_path / "old.joblib"))
+
+    trainer.save_current_model_as()
+
+    assert os.path.isfile(target)
+    assert trainer.model_path.get() == str(target)
+    assert dialogs["error"] == []
+
+
 # ── loading ───────────────────────────────────────────────────────────────────
 
 def test_loading_a_matching_model(tmp_path):

@@ -1,6 +1,9 @@
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
 import os
+import re
+import sys
 import cv2
 import numpy as np
 from joblib import dump, load
@@ -56,7 +59,21 @@ LOG_BACKUP_COUNT = 3
 _CLASSIFY_IMG_MAX_W = 820  # max width in the classify-images window (leaves room for button bar)
 _CLASSIFY_IMG_MAX_H = 460  # max height in the classify-images window
 _PREVIEW_IMG_MAX_W = 460   # max width of the latest-image preview on the Monitoring tab
-_PREVIEW_IMG_MAX_H = 260   # max height of the latest-image preview on the Monitoring tab
+_PREVIEW_IMG_MAX_H = 380   # max height (all-sky frames are usually square)
+
+# Colours. Only status text is coloured; everything else uses the platform theme.
+COLOR_TEXT = "#1f1f1f"
+COLOR_MUTED = "#666666"
+COLOR_OK = "#1a7f37"
+COLOR_WARN = "#9a5b00"
+COLOR_ERROR = "#b42318"
+COLOR_VIEWER_BG = "#1c1c1c"   # behind images, so frames are judged against a neutral dark
+COLOR_VIEWER_TEXT = "#a0a0a0"
+ROOF_STATUS_COLORS = {"OPEN": COLOR_OK, "CLOSED": COLOR_ERROR}
+
+# Settings are written this long after the last change, so typing into a field
+# does not rewrite the settings file on every keystroke.
+SETTINGS_SAVE_DELAY_MS = 600
 
 # Manual override duration choices shown in the Monitoring tab dropdown
 OVERRIDE_DURATIONS = ["1 hour", "4 hours", "Until noon", "Until midnight", "Forever"]
@@ -219,10 +236,19 @@ class RoofClassifierApp:
         self.logger = None
         self.ascom_server = None
         self._startup_model_error = None
+        # Why the last reported status differs from the model's raw call, if it does
+        self._last_status_reason = ""
+        # (status, updated) from the last pass's secondary-source read
+        self._last_secondary = None
+        # Window layout remembered between sessions
+        self._window_geometry = ""
+        self._window_zoomed = False
+        self._last_tab = None
         self.load_settings()
         self.setup_logging()
-        self.setup_gui()
+        # Before the GUI, so it opens on the right tab and shows the loaded model
         self._try_load_model_from_settings()
+        self.setup_gui()
         # Defer auto-start until the main loop is running so the UI is visible first.
         self.root.after(800, self._apply_auto_start)
 
@@ -316,6 +342,11 @@ class RoofClassifierApp:
                 self.notif_heartbeat_enabled.set(settings.get('notif_heartbeat_enabled', False))
                 self.notif_heartbeat_minutes.set(settings.get('notif_heartbeat_minutes', '5'))
                 self.notif_heartbeat_url.set(settings.get('notif_heartbeat_url', ''))
+
+                # Window layout
+                self._window_geometry = settings.get('window_geometry', '')
+                self._window_zoomed = bool(settings.get('window_zoomed', False))
+                self._last_tab = settings.get('last_tab')
         except Exception as e:
             print(f"Error loading settings: {e}")
 
@@ -362,6 +393,9 @@ class RoofClassifierApp:
                 'notif_heartbeat_enabled': self.notif_heartbeat_enabled.get(),
                 'notif_heartbeat_minutes': self.notif_heartbeat_minutes.get(),
                 'notif_heartbeat_url': self.notif_heartbeat_url.get(),
+                'window_geometry': getattr(self, '_window_geometry', ''),
+                'window_zoomed': getattr(self, '_window_zoomed', False),
+                'last_tab': getattr(self, '_last_tab', None),
             }
             # Atomic: a crash part-way through a settings save used to leave an
             # unparseable file, which silently reset every setting - including the
@@ -450,8 +484,7 @@ class RoofClassifierApp:
         """Honour the auto-start-on-launch options for ASCOM and monitoring."""
         if self.auto_start_ascom.get() and FLASK_AVAILABLE and not self.ascom_server:
             self.start_ascom_server(silent=True)
-            if self.ascom_server:
-                self.ascom_enabled.set(True)
+            self._update_ascom_display()
 
         if self.auto_start_monitoring.get() and not self.monitoring_active:
             if self.model:
@@ -462,19 +495,18 @@ class RoofClassifierApp:
     def start_ascom_server(self, silent=False):
         """Start the ASCOM Alpaca server.
 
-        When *silent* is True (used for auto-start on launch) the success/already-running
-        dialogs are suppressed; errors are still reported.
+        Success is shown in the ASCOM section and the status bar rather than in a
+        dialog. When *silent* is True (auto-start on launch) errors are logged
+        instead of shown.
         """
         if not FLASK_AVAILABLE:
             if not silent:
-                messagebox.showerror("Error", "Flask is not installed. Please install flask and flask-cors to use ASCOM Alpaca functionality.")
+                messagebox.showerror("ASCOM Unavailable", "Flask is not installed. Install flask and flask-cors to use the ASCOM Alpaca safety monitor.")
             return
 
         if self.ascom_server:
-            if not silent:
-                messagebox.showwarning("Warning", "ASCOM server is already running.")
             return
-            
+
         try:
             port = int(self.ascom_port.get())
             device_number = int(self.ascom_device_number.get())
@@ -495,52 +527,74 @@ class RoofClassifierApp:
             
             # Start server in a separate thread
             server_thread = threading.Thread(
-                target=self.ascom_server.run,
+                target=self._serve_ascom,
+                args=(self.ascom_server, silent),
                 daemon=True
             )
             server_thread.start()
             
+            self.ascom_enabled.set(True)
             if self.logger:
                 self.logger.info(f"ASCOM Alpaca server started on port {port}")
 
-            if not silent:
-                messagebox.showinfo("ASCOM Server Started",
-                    f"ASCOM Alpaca Safety Monitor started on port {port}\n"
-                    f"Device number: {device_number}\n"
-                    f"Management API: http://localhost:{port}/management/apiversions\n"
-                    f"Configure NINA to connect to: localhost:{port}")
-
         except ValueError:
             if not silent:
-                messagebox.showerror("Error", "Please enter valid numeric values for port and device number.")
+                messagebox.showerror("Invalid ASCOM Settings", "The port and device number must be whole numbers.")
+            elif self.logger:
+                self.logger.error(
+                    f"ASCOM auto-start skipped: invalid port {self.ascom_port.get()!r} "
+                    f"or device number {self.ascom_device_number.get()!r}")
         except Exception as e:
             if not silent:
-                messagebox.showerror("Error", f"Failed to start ASCOM server: {str(e)}")
+                messagebox.showerror("ASCOM Server Error", f"Could not start the ASCOM server: {e}")
             elif self.logger:
                 self.logger.error(f"Failed to auto-start ASCOM server: {e}")
 
+    def _serve_ascom(self, server, silent):
+        """Run *server* on this (worker) thread and report it if it dies.
+
+        The port is only bound here, after start_ascom_server has returned, so a
+        port already in use surfaces now. Werkzeug reports it with sys.exit(1),
+        hence BaseException. Without this the UI kept showing the server as
+        running with nothing listening.
+        """
+        try:
+            server.run()
+        except BaseException as e:
+            reason = "the port is probably in use" if isinstance(e, SystemExit) else str(e)
+            self._defer_to_ui(lambda: self._on_ascom_server_failed(server, reason, silent))
+
+    def _on_ascom_server_failed(self, server, reason, silent):
+        """Clear the state of a server that failed after starting (UI thread only)."""
+        if self.ascom_server is not server:
+            return  # already stopped or replaced
+        try:
+            server.stop()
+        except Exception:
+            pass
+        self.ascom_server = None
+        self.ascom_enabled.set(False)
+        self._update_ascom_display()
+        message = f"The ASCOM server on port {server.port} stopped: {reason}."
+        if self.logger:
+            self.logger.error(message)
+        if not silent:
+            messagebox.showerror("ASCOM Server Error",
+                                 message + "\n\nChoose another port and start the server again.")
+
     def stop_ascom_server(self):
         """Stop the ASCOM Alpaca server"""
-        if self.ascom_server:
-            try:
-                self.ascom_server.stop()
-                self.ascom_server = None
-                if self.logger:
-                    self.logger.info("ASCOM Alpaca server stopped")
-                messagebox.showinfo("ASCOM Server Stopped", "ASCOM Alpaca server has been stopped.")
-            except Exception as e:
-                messagebox.showerror("Error", f"Error stopping ASCOM server: {str(e)}")
-        else:
-            messagebox.showwarning("Warning", "ASCOM server is not running.")
-            
-    def on_ascom_enabled_changed(self):
-        """Called when ASCOM enabled checkbox is toggled"""
-        if self.ascom_enabled.get():
-            self.start_ascom_server()
-        else:
-            self.stop_ascom_server()
-        self.save_settings()
-        
+        if not self.ascom_server:
+            return
+        try:
+            self.ascom_server.stop()
+            self.ascom_server = None
+            self.ascom_enabled.set(False)
+            if self.logger:
+                self.logger.info("ASCOM Alpaca server stopped")
+        except Exception as e:
+            messagebox.showerror("ASCOM Server Error", f"Could not stop the ASCOM server: {e}")
+
     def test_ascom_discovery(self):
         """Test ASCOM discovery functionality"""
         try:
@@ -860,503 +914,734 @@ class RoofClassifierApp:
                 self.logger.error(f"Error reading secondary source: {e}")
             return None, None
 
+    # ── Look and feel ─────────────────────────────────────────────────────────
+
+    def _px(self, value):
+        """Scale a 96-DPI pixel size to the screen the window is on."""
+        return int(round(value * getattr(self, "_ui_scale", 1.0)))
+
+    def _init_style(self):
+        """Fonts, spacing and ttk styles shared by the main window and dialogs."""
+        self._ui_scale = max(1.0, self.root.winfo_fpixels("1i") / 96.0)
+        self._preview_max = (self._px(_PREVIEW_IMG_MAX_W), self._px(_PREVIEW_IMG_MAX_H))
+        self._left_column_wrap = self._px(400)
+
+        base = tkfont.nametofont("TkDefaultFont")
+        family, size = base.actual("family"), base.actual("size")
+        self.font_small = tkfont.Font(family=family, size=max(size - 1, 8))
+        self.font_bold = tkfont.Font(family=family, size=size, weight="bold")
+        self.font_status = tkfont.Font(family=family, size=size + 13, weight="bold")
+
+        style = ttk.Style(self.root)
+        style.configure("TLabelframe.Label", font=self.font_bold, foreground=COLOR_TEXT)
+        style.configure("Muted.TLabel", foreground=COLOR_MUTED, font=self.font_small)
+        style.configure("Heading.TLabel", font=self.font_bold)
+        style.configure("Treeview", rowheight=self._px(22))
+        style.configure("TNotebook.Tab", padding=(self._px(10), self._px(3)))
+
+    def _section(self, parent, title):
+        """A titled group of related settings."""
+        pad = self._px(10)
+        return ttk.LabelFrame(parent, text=title, padding=(pad, self._px(6), pad, pad))
+
+    def _hint(self, parent, text, **pack):
+        """Secondary explanatory text that wraps to the width it is given."""
+        label = ttk.Label(parent, text=text, style="Muted.TLabel", justify=tk.LEFT,
+                          wraplength=self._px(340))
+        label.bind("<Configure>",
+                   lambda e: label.configure(wraplength=max(e.width - 2, self._px(120))))
+        pack.setdefault("fill", "x")
+        label.pack(**pack)
+        return label
+
+    def _status_text(self, parent, text="", fg=COLOR_MUTED, **options):
+        """A plain Tk label for text whose colour carries meaning (ttk labels are
+        styled per class, not per widget)."""
+        options.setdefault("wraplength", self._left_column_wrap)
+        return tk.Label(parent, text=text, fg=fg, anchor="w", justify=tk.LEFT, **options)
+
+    def _field_row(self, parent, label, var, buttons=()):
+        """A label above an entry, with optional buttons beside the entry.
+
+        *buttons* is a sequence of ``(text, command)``. Returns ``(entry, [button, ...])``.
+        """
+        frame = ttk.Frame(parent)
+        frame.pack(fill="x", pady=(0, self._px(8)))
+        frame.columnconfigure(0, weight=1)
+        ttk.Label(frame, text=label).grid(row=0, column=0, columnspan=len(buttons) + 1,
+                                          sticky="w", pady=(0, self._px(2)))
+        entry = ttk.Entry(frame, textvariable=var, width=36)
+        entry.grid(row=1, column=0, sticky="ew")
+        made = []
+        for column, (text, command) in enumerate(buttons, start=1):
+            button = ttk.Button(frame, text=text, command=command)
+            button.grid(row=1, column=column, padx=(self._px(6), 0))
+            made.append(button)
+        return entry, made
+
+    def _button_row(self, parent, buttons, **pack):
+        """Pack ``(text, command)`` buttons left to right; returns the buttons."""
+        frame = ttk.Frame(parent)
+        pack.setdefault("fill", "x")
+        pack.setdefault("pady", (0, self._px(8)))
+        frame.pack(**pack)
+        made = []
+        for text, command in buttons:
+            button = ttk.Button(frame, text=text, command=command)
+            button.pack(side=tk.LEFT, padx=(0, self._px(6)))
+            made.append(button)
+        return made
+
+    @staticmethod
+    def _set_enabled(widget, enabled):
+        if isinstance(widget, ttk.Widget):
+            widget.state(["!disabled"] if enabled else ["disabled"])
+        else:
+            widget.configure(state=tk.NORMAL if enabled else tk.DISABLED)
+
+    def _enable_with(self, var, *widgets):
+        """Enable *widgets* only while the checkbox variable *var* is set."""
+        def sync(*_):
+            for widget in widgets:
+                self._set_enabled(widget, bool(var.get()))
+        var.trace_add("write", sync)
+        sync()
+
+    def _make_dialog(self, title, min_size=None):
+        """A secondary window placed over the main one; Escape closes it."""
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.transient(self.root)
+        win.bind("<Escape>", lambda e: win.destroy())
+        if min_size:
+            win.minsize(self._px(min_size[0]), self._px(min_size[1]))
+        return win
+
+    def _center_over_root(self, win, width=None, height=None):
+        """Size *win* (to its content unless given) and centre it over the main window."""
+        win.update_idletasks()
+        width = max(width or 0, win.winfo_reqwidth())
+        height = max(height or 0, win.winfo_reqheight())
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - width) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - height) // 3
+        win.geometry(f"{width}x{height}+{max(x, 0)}+{max(y, 0)}")
+
+    @staticmethod
+    def _short_source(source, limit=48):
+        """A file name or URL shortened for display."""
+        if len(source) <= limit:
+            return source
+        keep = (limit - 1) // 2
+        return f"{source[:keep]}…{source[-keep:]}"
+
+    @staticmethod
+    def _format_elapsed(seconds):
+        seconds = max(0, int(seconds))
+        if seconds < 60:
+            return f"{seconds} s"
+        minutes = seconds // 60
+        if minutes < 60:
+            return f"{minutes} min"
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours} h {minutes} min" if minutes else f"{hours} h"
+
+    # ── Main window ───────────────────────────────────────────────────────────
+
     def setup_gui(self):
-        # ── Persistent status bar (always visible at the bottom) ─────────────
-        statusbar_frame = tk.Frame(self.root, bd=1, relief=tk.SUNKEN)
-        statusbar_frame.pack(side=tk.BOTTOM, fill=tk.X)
+        self._init_style()
+        self._save_after_id = None
+        self._activity_after_id = None
+        self._obs_refresh_after_id = None
 
-        self.statusbar_label = tk.Label(
-            statusbar_frame, text="● Monitoring: Off", fg="gray",
-            anchor="w", padx=6, font=("Arial", 9)
-        )
-        self.statusbar_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._build_status_bar()
 
-        self.statusbar_toggle_btn = tk.Button(
-            statusbar_frame, text="Start Monitoring",
-            command=self.toggle_monitoring, pady=0, padx=6,
-            font=("Arial", 9)
-        )
-        self.statusbar_toggle_btn.pack(side=tk.RIGHT, padx=4, pady=1)
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill="both", expand=True, padx=self._px(8), pady=(self._px(8), self._px(4)))
+        self._tabs = {}
+        self._build_monitoring_tab()
+        self._build_training_tab()
+        self._build_configuration_tab()
+        self._build_notifications_tab()
+        self._build_utilities_tab()
 
-        # Top-level notebook for tabbed layout
-        notebook = ttk.Notebook(self.root)
-        notebook.pack(fill="both", expand=True, padx=5, pady=5)
+        self._restore_window_state()
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # ── Tab 1: Training & Model ───────────────────────────────────────────
-        tab_train = ttk.Frame(notebook)
-        notebook.add(tab_train, text="Training & Model")
+        # Every setting is saved shortly after it changes. Previously only buttons
+        # and checkboxes saved, so anything typed into a field was lost on exit.
+        for var in vars(self).values():
+            if isinstance(var, tk.Variable):
+                var.trace_add("write", self._schedule_save)
+        for var in (self.latitude, self.longitude, self.sun_angle_threshold):
+            var.trace_add("write", self._schedule_observation_refresh)
 
-        # Training section
-        train_frame = tk.LabelFrame(tab_train, text="Training Data", padx=5, pady=5)
-        train_frame.pack(fill="x", padx=10, pady=5)
-
-        # Training data folder row
-        td_folder_frame = tk.Frame(train_frame)
-        td_folder_frame.pack(fill="x", pady=2)
-        tk.Label(td_folder_frame, text="Training Data Folder:").pack(anchor="w")
-        td_folder_entry_frame = tk.Frame(td_folder_frame)
-        td_folder_entry_frame.pack(fill="x")
-        tk.Entry(td_folder_entry_frame, textvariable=self.training_data_folder, width=40).pack(side=tk.LEFT, fill="x", expand=True)
-        tk.Button(td_folder_entry_frame, text="Browse...", command=self.browse_training_data_folder).pack(side=tk.RIGHT, padx=(5, 0))
-
-        # Action buttons — two rows to avoid truncation on narrow panels
-        action_frame1 = tk.Frame(train_frame)
-        action_frame1.pack(fill="x", pady=(2, 1))
-        tk.Button(action_frame1, text="Add Frame (Open)", command=lambda: self.add_frame("open")).pack(side=tk.LEFT, padx=5)
-        tk.Button(action_frame1, text="Add Frame (Closed)", command=lambda: self.add_frame("closed")).pack(side=tk.LEFT, padx=5)
-
-        action_frame2 = tk.Frame(train_frame)
-        action_frame2.pack(fill="x", pady=(1, 2))
-        tk.Button(action_frame2, text="Clear Training Data", command=self.clear_training_data).pack(side=tk.LEFT, padx=5)
-        tk.Button(action_frame2, text="Classify Images", command=self.open_classify_images_window).pack(side=tk.LEFT, padx=5)
-
-        # Random sampling mode — split across two lines to avoid overflow on narrow panels
-        sample_frame = tk.Frame(train_frame)
-        sample_frame.pack(fill="x", pady=2)
-        tk.Checkbutton(sample_frame, text="Save random samples while monitoring (requires monitoring to be active)",
-                       variable=self.sample_mode_enabled, command=self.save_settings).pack(anchor="w")
-        sample_rate_frame = tk.Frame(train_frame)
-        sample_rate_frame.pack(fill="x", pady=(0, 2))
-        tk.Label(sample_rate_frame, text="Sample rate (0–1):").pack(side=tk.LEFT, padx=(5, 2))
-        tk.Entry(sample_rate_frame, textvariable=self.sample_rate, width=5).pack(side=tk.LEFT)
-
-        # Targeted frame capture while monitoring (saved to the unclassified folder)
-        tk.Checkbutton(train_frame,
-                       text="Save frame when reported status toggles (OPEN↔CLOSED)",
-                       variable=self.save_on_toggle_enabled, command=self.save_settings).pack(anchor="w")
-        tk.Checkbutton(train_frame,
-                       text="Save first frame when model disagrees with secondary roof file",
-                       variable=self.save_on_disagreement_enabled, command=self.save_settings).pack(anchor="w")
-
-        # Stats display
-        self.stats_label = tk.Label(train_frame, text="Training set: Open: 0, Closed: 0", fg="blue")
-        self.stats_label.pack(pady=5)
         self.update_training_stats()
-
-        # Model section
-        model_frame = tk.LabelFrame(tab_train, text="Model", padx=5, pady=5)
-        model_frame.pack(fill="x", padx=10, pady=5)
-
-        model_btn_frame1 = tk.Frame(model_frame)
-        model_btn_frame1.pack(fill="x", pady=(2, 1))
-        tk.Button(model_btn_frame1, text="Train Model", command=self.train_model).pack(side=tk.LEFT, padx=5)
-        tk.Button(model_btn_frame1, text="Load Model", command=self.load_model).pack(side=tk.LEFT, padx=5)
-
-        model_btn_frame2 = tk.Frame(model_frame)
-        model_btn_frame2.pack(fill="x", pady=(1, 1))
-        tk.Button(model_btn_frame2, text="Validate Model", command=self.validate_model).pack(side=tk.LEFT, padx=5)
-        tk.Button(model_btn_frame2, text="Save Model As...", command=self.save_current_model_as).pack(side=tk.LEFT, padx=5)
-
-        model_btn_frame3 = tk.Frame(model_frame)
-        model_btn_frame3.pack(fill="x", pady=(1, 2))
-        tk.Button(model_btn_frame3, text="Benchmark Models", command=self.benchmark_models).pack(side=tk.LEFT, padx=5)
-
-        # Model path with browse button
-        model_path_frame = tk.Frame(model_frame)
-        model_path_frame.pack(fill="x", pady=5)
-        tk.Label(model_path_frame, text="Current Model:").pack(anchor="w")
-        path_entry_frame = tk.Frame(model_path_frame)
-        path_entry_frame.pack(fill="x")
-        tk.Entry(path_entry_frame, textvariable=self.model_path, width=40).pack(side=tk.LEFT, fill="x", expand=True)
-        tk.Button(path_entry_frame, text="Browse...", command=self.browse_model_path).pack(side=tk.RIGHT, padx=(5,0))
-
-        # Fixed validation set path
-        val_set_frame = tk.Frame(model_frame)
-        val_set_frame.pack(fill="x", pady=2)
-        tk.Label(val_set_frame, text="Fixed Validation Set Folder:").pack(anchor="w")
-        val_set_entry_frame = tk.Frame(val_set_frame)
-        val_set_entry_frame.pack(fill="x")
-        tk.Entry(val_set_entry_frame, textvariable=self.validation_set_path, width=40).pack(side=tk.LEFT, fill="x", expand=True)
-        tk.Button(val_set_entry_frame, text="Browse...", command=self.browse_validation_set).pack(side=tk.RIGHT, padx=(5, 0))
-
-        # ── Tab 2: Monitoring ─────────────────────────────────────────────────
-        tab_monitor = ttk.Frame(notebook)
-        notebook.add(tab_monitor, text="Monitoring")
-
-        monitor_frame = tk.LabelFrame(tab_monitor, text="Monitoring", padx=5, pady=5)
-        monitor_frame.pack(fill="x", padx=10, pady=5)
-
-        # Monitor folder with browse button
-        monitor_folder_frame = tk.Frame(monitor_frame)
-        monitor_folder_frame.pack(fill="x", pady=2)
-        tk.Label(monitor_folder_frame, text="Monitor Folder:").pack(anchor="w")
-        folder_entry_frame = tk.Frame(monitor_folder_frame)
-        folder_entry_frame.pack(fill="x")
-        tk.Entry(folder_entry_frame, textvariable=self.monitor_path, width=40).pack(side=tk.LEFT, fill="x", expand=True)
-        tk.Button(folder_entry_frame, text="Browse...", command=self.browse_monitor_folder).pack(side=tk.RIGHT, padx=(5,0))
-
-        # Output file with browse button
-        output_file_frame = tk.Frame(monitor_frame)
-        output_file_frame.pack(fill="x", pady=2)
-        tk.Label(output_file_frame, text="Output Status File:").pack(anchor="w")
-        output_entry_frame = tk.Frame(output_file_frame)
-        output_entry_frame.pack(fill="x")
-        tk.Entry(output_entry_frame, textvariable=self.output_path, width=40).pack(side=tk.LEFT, fill="x", expand=True)
-        tk.Button(output_entry_frame, text="Browse...", command=self.browse_output_file).pack(side=tk.RIGHT, padx=(5,0))
-
-        # Camera URL row
-        camera_url_outer = tk.Frame(monitor_frame)
-        camera_url_outer.pack(fill="x", pady=2)
-        tk.Label(camera_url_outer, text="Camera Image URL (optional, overrides folder):").pack(anchor="w")
-        camera_url_inner = tk.Frame(camera_url_outer)
-        camera_url_inner.pack(fill="x")
-        tk.Entry(camera_url_inner, textvariable=self.camera_url, width=40).pack(side=tk.LEFT, fill="x", expand=True)
-        tk.Button(camera_url_inner, text="Test", command=self._test_camera_url).pack(side=tk.RIGHT, padx=(5, 0))
-
-        tk.Checkbutton(monitor_frame, text="Auto-start monitoring on launch",
-                       variable=self.auto_start_monitoring, command=self.save_settings).pack(anchor="w", pady=(2, 0))
-
-        button_frame = tk.Frame(monitor_frame)
-        button_frame.pack(pady=5)
-        tk.Button(button_frame, text="Start Monitoring", command=self.start_monitoring).pack(side=tk.LEFT, padx=5)
-        tk.Button(button_frame, text="Stop Monitoring", command=self.stop_monitoring).pack(side=tk.LEFT, padx=5)
-
-        # Monitoring status display
-        status_frame = tk.Frame(monitor_frame)
-        status_frame.pack(fill="x", pady=5)
-        self.status_label = tk.Label(status_frame, text="Monitoring: Not active", fg="gray")
-        self.status_label.pack()
-        self.countdown_label = tk.Label(status_frame, text="", fg="blue")
-        self.countdown_label.pack()
-        self.hash_status_label = tk.Label(status_frame, text="Image hash: Not monitoring", fg="gray",
-                                          font=("Arial", 8))
-        self.hash_status_label.pack()
-        self.sun_status_label = tk.Label(status_frame, text="Sun altitude: --", fg="gray",
-                                         font=("Arial", 9))
-        self.sun_status_label.pack()
-
-        # ── Manual override ───────────────────────────────────────────────────
-        override_frame = tk.LabelFrame(tab_monitor, text="Manual Override", padx=5, pady=5)
-        override_frame.pack(fill="x", padx=10, pady=5)
-
-        override_radio_frame = tk.Frame(override_frame)
-        override_radio_frame.pack(fill="x", pady=2)
-        tk.Radiobutton(override_radio_frame, text="Auto (use model)",
-                       variable=self.override_mode, value="AUTO").pack(side=tk.LEFT)
-        tk.Radiobutton(override_radio_frame, text="Force OPEN",
-                       variable=self.override_mode, value="OPEN").pack(side=tk.LEFT, padx=(10, 0))
-        tk.Radiobutton(override_radio_frame, text="Force CLOSED",
-                       variable=self.override_mode, value="CLOSED").pack(side=tk.LEFT, padx=(10, 0))
-
-        override_duration_frame = tk.Frame(override_frame)
-        override_duration_frame.pack(fill="x", pady=2)
-        tk.Label(override_duration_frame, text="Duration:").pack(side=tk.LEFT)
-        ttk.Combobox(override_duration_frame, textvariable=self.override_duration,
-                     values=OVERRIDE_DURATIONS, state="readonly",
-                     width=14).pack(side=tk.LEFT, padx=(5, 10))
-        tk.Button(override_duration_frame, text="Apply Override",
-                  command=self.apply_manual_override).pack(side=tk.LEFT, padx=2)
-        tk.Button(override_duration_frame, text="Clear Override",
-                  command=self.clear_manual_override).pack(side=tk.LEFT, padx=2)
-
-        self.override_status_label = tk.Label(override_frame,
-                                              text="No override — reporting model output",
-                                              fg="gray", font=("Arial", 9))
-        self.override_status_label.pack(anchor="w", pady=(2, 0))
-
-        tk.Label(override_frame,
-                 text=("Overrides the status written to the output file and reported to ASCOM "
-                       "clients.\nThe sun angle guard still vetoes the ASCOM 'IsSafe' flag, so a "
-                       "forced OPEN\nis not reported as safe while the sun is above the threshold."),
-                 fg="darkgreen", font=("Arial", 8), justify=tk.LEFT).pack(anchor="w")
-
-        # ── Latest image preview ──────────────────────────────────────────────
-        preview_frame = tk.LabelFrame(tab_monitor, text="Latest All-Sky Image", padx=5, pady=5)
-        preview_frame.pack(fill="both", expand=True, padx=10, pady=5)
-
-        tk.Checkbutton(preview_frame, text="Show preview",
-                       variable=self.preview_enabled,
-                       command=self.on_preview_enabled_changed).pack(anchor="w")
-
-        # Fixed-size holder so the panel does not jump around as images load
-        self.preview_holder = tk.Frame(preview_frame, bg="black",
-                                       width=_PREVIEW_IMG_MAX_W, height=_PREVIEW_IMG_MAX_H)
-        self.preview_holder.pack(pady=2)
-        self.preview_holder.pack_propagate(False)
-
-        self.preview_label = tk.Label(self.preview_holder, text="(no image loaded yet)",
-                                      fg="gray", bg="black")
-        self.preview_label.pack(fill="both", expand=True)
-
-        self.preview_bottom_frame = tk.Frame(preview_frame)
-        self.preview_bottom_frame.pack(fill="x", pady=2)
-        self.preview_caption_label = tk.Label(self.preview_bottom_frame, text="", fg="gray",
-                                              font=("Arial", 8), anchor="w")
-        self.preview_caption_label.pack(side=tk.LEFT, fill="x", expand=True)
-        tk.Button(self.preview_bottom_frame, text="Refresh",
-                  command=self.refresh_preview).pack(side=tk.RIGHT, padx=(5, 0))
-
-        if not self.preview_enabled.get():
-            self.preview_holder.pack_forget()
-            self.preview_bottom_frame.pack_forget()
-
-        # Keep the override countdown live, and populate the preview once at startup
+        self._update_model_display()
         self._update_override_display()
+        self._update_ascom_display()
+        self._render_roof_status()
         self.root.after(1000, self._tick_override_display)
+        self.root.after(300, self.update_observation_window_display)
         if self.preview_enabled.get():
             self.root.after(1200, self.refresh_preview)
 
-        # ── Tab 3: Configuration ──────────────────────────────────────────────
-        tab_config = ttk.Frame(notebook)
-        notebook.add(tab_config, text="Configuration")
+    def _build_status_bar(self):
+        bar = ttk.Frame(self.root, padding=(self._px(8), self._px(3), self._px(6), self._px(4)))
+        bar.pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Separator(self.root, orient="horizontal").pack(side=tk.BOTTOM, fill=tk.X)
 
-        config_frame = tk.LabelFrame(tab_config, text="Configuration", padx=5, pady=5)
-        config_frame.pack(fill="x", padx=10, pady=5)
+        self.statusbar_toggle_btn = ttk.Button(bar, text="Start Monitoring",
+                                               command=self.toggle_monitoring)
+        self.statusbar_toggle_btn.pack(side=tk.RIGHT)
 
-        # Logging configuration
-        log_frame = tk.Frame(config_frame)
-        log_frame.pack(fill="x", pady=2)
+        self.statusbar_label = tk.Label(bar, text="● Monitoring off", fg=COLOR_MUTED, anchor="w")
+        self.statusbar_label.pack(side=tk.LEFT)
+        ttk.Separator(bar, orient="vertical").pack(side=tk.LEFT, fill="y", padx=self._px(10))
+        self.statusbar_ascom_label = tk.Label(bar, text="", fg=COLOR_MUTED, anchor="w")
+        self.statusbar_ascom_label.pack(side=tk.LEFT)
+        ttk.Separator(bar, orient="vertical").pack(side=tk.LEFT, fill="y", padx=self._px(10))
+        self.statusbar_model_label = tk.Label(bar, text="", fg=COLOR_MUTED, anchor="w")
+        self.statusbar_model_label.pack(side=tk.LEFT)
+        self.activity_label = tk.Label(bar, text="", fg=COLOR_MUTED, anchor="e")
+        self.activity_label.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(self._px(10), self._px(10)))
 
-        log_checkbox = tk.Checkbutton(log_frame, text="Enable Logging to File",
-                                     variable=self.log_enabled, command=self.on_log_enabled_changed)
-        log_checkbox.pack(side=tk.LEFT)
+    def _new_tab(self, key, title, columns=2):
+        tab = ttk.Frame(self.notebook, padding=self._px(12))
+        self.notebook.add(tab, text=title)
+        self._tabs[key] = tab
+        tab.rowconfigure(0, weight=1)
+        cols = []
+        for index in range(columns):
+            tab.columnconfigure(index, weight=1, uniform="tabcols" if columns > 1 else None)
+            col = ttk.Frame(tab)
+            col.grid(row=0, column=index, sticky="nsew",
+                     padx=(0, self._px(12) if index < columns - 1 else 0))
+            cols.append(col)
+        return tab, cols
 
-        log_path_frame = tk.Frame(log_frame)
-        log_path_frame.pack(side=tk.RIGHT, fill="x", expand=True, padx=(10,0))
-        tk.Entry(log_path_frame, textvariable=self.log_path, width=30).pack(side=tk.LEFT, fill="x", expand=True)
-        tk.Button(log_path_frame, text="Browse...", command=self.browse_log_file).pack(side=tk.RIGHT, padx=(5,0))
+    def _build_monitoring_tab(self):
+        gap = self._px(12)
+        tab = ttk.Frame(self.notebook, padding=gap)
+        self.notebook.add(tab, text="Monitoring")
+        self._tabs["monitor"] = tab
+        tab.columnconfigure(1, weight=1)
+        tab.rowconfigure(0, weight=1)
+        left = ttk.Frame(tab)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, gap))
+        right = ttk.Frame(tab)
+        right.grid(row=0, column=1, sticky="nsew")
 
-        # Observatory location
-        location_frame = tk.Frame(config_frame)
-        location_frame.pack(fill="x", pady=2)
-        tk.Label(location_frame, text="Observatory Location:").pack(side=tk.LEFT)
-        tk.Label(location_frame, text="Lat:").pack(side=tk.LEFT, padx=(10,0))
-        tk.Entry(location_frame, textvariable=self.latitude, width=8).pack(side=tk.LEFT, padx=(2,5))
-        tk.Label(location_frame, text="Lon:").pack(side=tk.LEFT)
-        tk.Entry(location_frame, textvariable=self.longitude, width=8).pack(side=tk.LEFT, padx=(2,5))
+        # Roof status: what is being reported right now, and why
+        # (Start/Stop lives in the status bar, where it is reachable from every tab.)
+        card = self._section(left, "Roof Status")
+        card.pack(fill="x")
+        self.roof_status_label = tk.Label(card, text="—", font=self.font_status,
+                                          fg=COLOR_MUTED, anchor="w")
+        self.roof_status_label.pack(fill="x")
+        self.roof_status_note = self._status_text(card)
+        self.roof_status_note.pack(fill="x")
 
-        # Twilight threshold configuration
-        twilight_frame = tk.Frame(config_frame)
-        twilight_frame.pack(fill="x", pady=2)
-        tk.Label(twilight_frame, text="Sun Angle Threshold:").pack(side=tk.LEFT)
+        ttk.Separator(card).pack(fill="x", pady=self._px(8))
+        check_row = ttk.Frame(card)
+        check_row.pack(fill="x")
+        self.countdown_label = self._status_text(check_row)
+        self.countdown_label.pack(side=tk.RIGHT, anchor="n")
+        self.status_label = self._status_text(check_row, "Not monitoring",
+                                              wraplength=self._px(290))
+        self.status_label.pack(side=tk.LEFT, fill="x", expand=True)
+        self.hash_status_label = self._status_text(card, "Image: —")
+        self.hash_status_label.pack(fill="x")
+        self.sun_status_label = self._status_text(card, "Sun altitude: —")
+        self.sun_status_label.pack(fill="x")
+        # Packed only while a secondary source is configured (see _set_secondary_line)
+        self.secondary_status_label = self._status_text(card)
 
-        # Manual threshold entry
-        tk.Entry(twilight_frame, textvariable=self.sun_angle_threshold, width=6).pack(side=tk.LEFT, padx=(2,0))
-        tk.Label(twilight_frame, text="°").pack(side=tk.LEFT)
+        self._autostart_check = ttk.Checkbutton(card, text="Start monitoring when the app opens",
+                                                variable=self.auto_start_monitoring)
+        self._autostart_check.pack(anchor="w", pady=(self._px(8), 0))
 
-        # Twilight presets
-        preset_frame = tk.Frame(config_frame)
-        preset_frame.pack(fill="x", pady=2)
-        tk.Label(preset_frame, text="Presets:").pack(side=tk.LEFT)
-        for preset_name in TWILIGHT_PRESETS.keys():
-            tk.Button(preset_frame, text=preset_name,
-                     command=lambda p=preset_name: self.apply_twilight_preset(p)).pack(side=tk.LEFT, padx=2)
+        # Manual override
+        override = self._section(left, "Manual Override")
+        override.pack(fill="x", pady=(gap, 0))
+        radios = ttk.Frame(override)
+        radios.pack(fill="x", pady=(0, self._px(6)))
+        for text, value in (("Use the model", "AUTO"), ("Force OPEN", "OPEN"),
+                            ("Force CLOSED", "CLOSED")):
+            ttk.Radiobutton(radios, text=text, variable=self.override_mode,
+                            value=value).pack(side=tk.LEFT, padx=(0, self._px(14)))
 
-        # Observation window display
-        window_frame = tk.Frame(config_frame)
-        window_frame.pack(fill="x", pady=5)
-        self.obs_window_label = tk.Label(window_frame, text="Calculating observation window...",
-                                   fg="darkgreen", justify=tk.LEFT, font=("Arial", 9))
-        self.obs_window_label.pack(side=tk.LEFT)
-        tk.Button(window_frame, text="Refresh", command=self.update_observation_window_display).pack(side=tk.RIGHT)
+        duration = ttk.Frame(override)
+        duration.pack(fill="x", pady=(0, self._px(6)))
+        ttk.Label(duration, text="For").pack(side=tk.LEFT)
+        ttk.Combobox(duration, textvariable=self.override_duration, values=OVERRIDE_DURATIONS,
+                     state="readonly", width=14).pack(side=tk.LEFT, padx=(self._px(6), self._px(10)))
+        ttk.Button(duration, text="Apply",
+                   command=self.apply_manual_override).pack(side=tk.LEFT, padx=(0, self._px(6)))
+        self.override_clear_btn = ttk.Button(duration, text="Clear",
+                                             command=self.clear_manual_override)
+        self.override_clear_btn.pack(side=tk.LEFT)
 
-        # UTC time note
-        utc_note_frame = tk.Frame(config_frame)
-        utc_note_frame.pack(fill="x", pady=2)
-        tk.Label(utc_note_frame, text="All times UTC",
-                fg="gray", font=("Arial", 8)).pack(anchor="w")
+        self.override_status_label = self._status_text(override)
+        self.override_status_label.pack(fill="x", pady=(0, self._px(4)))
+        self._hint(override,
+                   "Forces the status written to the file and reported to ASCOM clients. "
+                   "ASCOM still reports unsafe while the sun is above the threshold, "
+                   "even under a forced OPEN.")
 
-        # Update window display after GUI is set up
-        self.root.after(1000, self.update_observation_window_display)
+        # Latest image
+        preview = self._section(right, "Latest Image")
+        preview.pack(fill="both", expand=True)
+        self.preview_bottom_frame = ttk.Frame(preview)
+        self.preview_bottom_frame.pack(side=tk.BOTTOM, fill="x", pady=(self._px(6), 0))
+        self.preview_refresh_btn = ttk.Button(self.preview_bottom_frame, text="Refresh",
+                                              command=self.refresh_preview)
+        self.preview_refresh_btn.pack(side=tk.RIGHT)
+        ttk.Checkbutton(self.preview_bottom_frame, text="Show preview",
+                        variable=self.preview_enabled,
+                        command=self.on_preview_enabled_changed).pack(side=tk.RIGHT, padx=self._px(10))
+        self.preview_caption_label = tk.Label(self.preview_bottom_frame, text="", fg=COLOR_MUTED,
+                                              anchor="w", font=self.font_small)
+        self.preview_caption_label.pack(side=tk.LEFT, fill="x", expand=True)
 
-        # Secondary source — either a local file path or an HTTP(S) URL
-        secondary_outer = tk.Frame(config_frame)
-        secondary_outer.pack(fill="x", pady=2)
+        width, height = self._preview_max
+        self.preview_holder = tk.Frame(preview, bg=COLOR_VIEWER_BG, width=width, height=height)
+        self.preview_holder.pack(side=tk.TOP, fill="both", expand=True)
+        self.preview_holder.pack_propagate(False)
+        self.preview_label = tk.Label(self.preview_holder, text="No image yet",
+                                      fg=COLOR_VIEWER_TEXT, bg=COLOR_VIEWER_BG)
+        self.preview_label.pack(fill="both", expand=True)
 
-        secondary_checkbox = tk.Checkbutton(secondary_outer,
-                                          text="Monitor Secondary Roof Status File or URL",
-                                          variable=self.secondary_source_enabled)
-        secondary_checkbox.pack(anchor="w")
+        if not self.preview_enabled.get():
+            self.preview_holder.pack_forget()
+            self.preview_refresh_btn.state(["disabled"])
+            self.preview_caption_label.config(text="Preview hidden")
 
-        secondary_path_frame = tk.Frame(secondary_outer)
-        secondary_path_frame.pack(fill="x", padx=(20, 0))
-        tk.Entry(secondary_path_frame, textvariable=self.secondary_source_path, width=30).pack(side=tk.LEFT, fill="x", expand=True)
-        tk.Button(secondary_path_frame, text="Test", command=self._test_secondary_source).pack(side=tk.RIGHT, padx=(5,0))
-        tk.Button(secondary_path_frame, text="Browse...", command=self.browse_secondary_source).pack(side=tk.RIGHT, padx=(5,0))
+    def _build_training_tab(self):
+        _tab, (left, right) = self._new_tab("training", "Training & Model")
 
-        tk.Label(secondary_outer,
-                 text="Accepts a local file path or an http(s):// URL. The last line must contain OPEN or CLOSED.",
-                 fg="darkgreen", font=("Arial", 8)).pack(anchor="w", padx=(20, 0))
+        data = self._section(left, "Training Data")
+        data.pack(fill="x")
+        self._field_row(data, "Training data folder", self.training_data_folder,
+                        [("Browse…", self.browse_training_data_folder)])
+        self.training_data_folder.trace_add("write", lambda *_: self.update_training_stats())
+        self.stats_label = ttk.Label(data, text="")
+        self.stats_label.pack(anchor="w", pady=(0, self._px(8)))
+        self._button_row(data, [("Add Open Images…", lambda: self.add_frame("open")),
+                                ("Add Closed Images…", lambda: self.add_frame("closed"))])
+        self._button_row(data, [("Review Unclassified…", self.open_classify_images_window),
+                                ("Clear Training Data…", self.clear_training_data)])
+        self._hint(data, "Images live in open/, closed/ and unclassified/ subfolders of this "
+                         "folder. Leave it empty to use the folder the app runs from.")
 
-        # ASCOM Alpaca configuration section
+        collect = self._section(left, "Collect Frames While Monitoring")
+        collect.pack(fill="x", pady=(self._px(12), 0))
+        sample = ttk.Frame(collect)
+        sample.pack(fill="x", pady=(0, self._px(2)))
+        ttk.Checkbutton(sample, text="Save a random sample of frames, at a rate of",
+                        variable=self.sample_mode_enabled).pack(side=tk.LEFT)
+        rate_entry = ttk.Entry(sample, textvariable=self.sample_rate, width=6)
+        rate_entry.pack(side=tk.LEFT, padx=(self._px(4), 0))
+        self._enable_with(self.sample_mode_enabled, rate_entry)
+        ttk.Checkbutton(collect, text="Save the frame whenever the model's status changes",
+                        variable=self.save_on_toggle_enabled).pack(anchor="w", pady=(0, self._px(2)))
+        ttk.Checkbutton(collect, text="Save the first frame where the model disagrees with "
+                                      "the secondary roof status",
+                        variable=self.save_on_disagreement_enabled).pack(anchor="w", pady=(0, self._px(6)))
+        self._hint(collect, "Collected frames go to unclassified/ so you can label them with "
+                            "Review Unclassified. A rate of 0.1 keeps about one frame in ten.")
+
+        model = self._section(right, "Model")
+        model.pack(fill="x")
+        self.model_status_label = self._status_text(model, font=self.font_bold)
+        self.model_status_label.pack(fill="x")
+        self.model_path_label = self._status_text(model, font=self.font_small)
+        self.model_path_label.pack(fill="x", pady=(0, self._px(8)))
+        _train, _load, save_as = self._button_row(model, [("Train Model", self.train_model),
+                                                          ("Load Model…", self.load_model),
+                                                          ("Save Model As…", self.save_current_model_as)])
+        self._hint(model, "Training uses every image in open/ and closed/. If a model file is "
+                          "loaded, training saves over it.")
+
+        validation = self._section(right, "Validation")
+        validation.pack(fill="x", pady=(self._px(12), 0))
+        self._field_row(validation, "Fixed validation set", self.validation_set_path,
+                        [("Browse…", self.browse_validation_set)])
+        validate, _benchmark = self._button_row(validation, [("Validate Model", self.validate_model),
+                                                             ("Benchmark Models…", self.benchmark_models)])
+        # Enabled by _update_model_display once a model is loaded
+        self._model_required_buttons = (save_as, validate)
+        self._hint(validation, "A folder with open/ and closed/ subfolders, kept separate from "
+                               "the training images. If it is empty, Validate asks for a folder.")
+
+    def _build_configuration_tab(self):
+        _tab, (left, right) = self._new_tab("config", "Configuration")
+        gap = self._px(12)
+
+        source = self._section(left, "Image Source")
+        source.pack(fill="x")
+        self._field_row(source, "Image folder", self.monitor_path,
+                        [("Browse…", self.browse_monitor_folder)])
+        self._field_row(source, "Camera image URL (optional)", self.camera_url,
+                        [("Test", self._test_camera_url)])
+        self._hint(source, "The newest image in the folder is checked every minute. If a camera "
+                           "URL is set, the image is downloaded from it instead.")
+
+        output = self._section(left, "Status Output")
+        output.pack(fill="x", pady=(gap, 0))
+        self._field_row(output, "Roof status file", self.output_path,
+                        [("Browse…", self.browse_output_file)])
+        self._hint(output, "Rewritten after every check with a single OPEN or CLOSED line, in "
+                           "the roof file format that ASCOM safety monitor drivers read.")
+
+        site = self._section(left, "Observatory")
+        site.pack(fill="x", pady=(gap, 0))
+        grid = ttk.Frame(site)
+        grid.pack(fill="x", pady=(0, self._px(6)))
+        ttk.Label(grid, text="Latitude").grid(row=0, column=0, sticky="w")
+        ttk.Entry(grid, textvariable=self.latitude, width=10).grid(
+            row=0, column=1, sticky="w", padx=(self._px(6), self._px(18)))
+        ttk.Label(grid, text="Longitude").grid(row=0, column=2, sticky="w")
+        ttk.Entry(grid, textvariable=self.longitude, width=10).grid(
+            row=0, column=3, sticky="w", padx=(self._px(6), 0))
+        ttk.Label(grid, text="Sun limit (°)").grid(row=1, column=0, sticky="w", pady=(self._px(6), 0))
+        ttk.Entry(grid, textvariable=self.sun_angle_threshold, width=10).grid(
+            row=1, column=1, sticky="w", padx=(self._px(6), 0), pady=(self._px(6), 0))
+
+        presets = ttk.Frame(site)
+        presets.pack(fill="x", pady=(0, self._px(6)))
+        for name, angle in TWILIGHT_PRESETS.items():
+            label = "Horizon" if angle == "0.0" else name
+            ttk.Button(presets, text=f"{label} ({float(angle):g}°)",
+                       command=lambda p=name: self.apply_twilight_preset(p)).pack(
+                side=tk.LEFT, padx=(0, self._px(4)))
+        self._hint(site, "OPEN is only reported while the sun is below this altitude. "
+                         "Longitude is positive east of Greenwich.")
+        self.obs_window_label = self._status_text(site, "", fg=COLOR_TEXT)
+        self.obs_window_label.pack(fill="x", pady=(self._px(6), 0))
+
+        secondary = self._section(right, "Secondary Roof Status")
+        secondary.pack(fill="x")
+        ttk.Checkbutton(secondary, text="Compare with another roof status file or URL",
+                        variable=self.secondary_source_enabled).pack(anchor="w", pady=(0, self._px(6)))
+        entry, buttons = self._field_row(secondary, "File path or http(s) URL",
+                                         self.secondary_source_path,
+                                         [("Browse…", self.browse_secondary_source),
+                                          ("Test", self._test_secondary_source)])
+        self._enable_with(self.secondary_source_enabled, entry, *buttons)
+        self._hint(secondary, "The last line must contain OPEN or CLOSED. Used for comparison "
+                              "and logging only; it never changes the reported status.")
+
+        ascom = self._section(right, "ASCOM Alpaca Safety Monitor")
+        ascom.pack(fill="x", pady=(gap, 0))
         if FLASK_AVAILABLE:
-            ascom_frame = tk.LabelFrame(tab_config, text="ASCOM Alpaca Safety Monitor", padx=5, pady=5)
-            ascom_frame.pack(fill="x", padx=10, pady=5)
-
-            # Enable ASCOM checkbox
-            ascom_enable_frame = tk.Frame(ascom_frame)
-            ascom_enable_frame.pack(fill="x", pady=2)
-
-            ascom_checkbox = tk.Checkbutton(ascom_enable_frame, text="Enable ASCOM Alpaca Safety Monitor",
-                                          variable=self.ascom_enabled, command=self.on_ascom_enabled_changed)
-            ascom_checkbox.pack(side=tk.LEFT)
-
-            tk.Checkbutton(ascom_frame, text="Auto-start ASCOM server on launch",
-                           variable=self.auto_start_ascom, command=self.save_settings).pack(anchor="w", pady=(2, 0))
-
-            # Port and device number configuration
-            ascom_config_frame = tk.Frame(ascom_frame)
-            ascom_config_frame.pack(fill="x", pady=2)
-
-            tk.Label(ascom_config_frame, text="Port:").pack(side=tk.LEFT)
-            tk.Entry(ascom_config_frame, textvariable=self.ascom_port, width=6).pack(side=tk.LEFT, padx=(2,10))
-
-            tk.Label(ascom_config_frame, text="Device Number:").pack(side=tk.LEFT)
-            tk.Entry(ascom_config_frame, textvariable=self.ascom_device_number, width=6).pack(side=tk.LEFT, padx=(2,10))
-
-            # Manual control buttons — two rows to avoid truncation on narrow panels
-            ascom_buttons_frame1 = tk.Frame(ascom_frame)
-            ascom_buttons_frame1.pack(fill="x", pady=(2, 1))
-
-            tk.Button(ascom_buttons_frame1, text="Start ASCOM Server",
-                     command=self.start_ascom_server).pack(side=tk.LEFT, padx=5)
-            tk.Button(ascom_buttons_frame1, text="Stop ASCOM Server",
-                     command=self.stop_ascom_server).pack(side=tk.LEFT, padx=5)
-
-            ascom_buttons_frame2 = tk.Frame(ascom_frame)
-            ascom_buttons_frame2.pack(fill="x", pady=(1, 2))
-
-            tk.Button(ascom_buttons_frame2, text="Test Discovery",
-                     command=self.test_ascom_discovery).pack(side=tk.LEFT, padx=5)
-            tk.Button(ascom_buttons_frame2, text="Open Setup Page",
-                     command=self.open_ascom_setup_page).pack(side=tk.LEFT, padx=5)
-
-            # Information
-            ascom_info_frame = tk.Frame(ascom_frame)
-            ascom_info_frame.pack(fill="x", pady=2)
-
-            info_text = ("Configure NINA to connect to this Safety Monitor:\n"
-                        "• NINA will auto-discover this device (recommended)\n"
-                        "• Or manually configure:\n"
-                        "  - Device Type: Safety Monitor (Alpaca)\n"
-                        "  - IP Address: localhost or your computer's IP\n"
-                        "  - Port: (as configured above)\n"
-                        "  - Device Number: (as configured above)\n"
-                        "• Discovery runs on UDP port 32227\n"
-                        "• Use 'Test Discovery' to verify network setup")
-
-            tk.Label(ascom_info_frame, text=info_text, font=("Arial", 8),
-                    fg="darkgreen", justify=tk.LEFT).pack(anchor="w")
+            self.ascom_status_label = self._status_text(ascom, "", wraplength=self._px(360))
+            self.ascom_status_label.pack(fill="x", pady=(0, self._px(8)))
+            ports = ttk.Frame(ascom)
+            ports.pack(fill="x", pady=(0, self._px(8)))
+            ttk.Label(ports, text="Port").pack(side=tk.LEFT)
+            self.ascom_port_entry = ttk.Entry(ports, textvariable=self.ascom_port, width=7)
+            self.ascom_port_entry.pack(side=tk.LEFT, padx=(self._px(6), self._px(18)))
+            ttk.Label(ports, text="Device number").pack(side=tk.LEFT)
+            self.ascom_device_entry = ttk.Entry(ports, textvariable=self.ascom_device_number, width=5)
+            self.ascom_device_entry.pack(side=tk.LEFT, padx=(self._px(6), 0))
+            self.ascom_toggle_btn, self.ascom_discovery_btn, self.ascom_setup_btn = self._button_row(
+                ascom, [("Start Server", self.toggle_ascom_server),
+                        ("Test Discovery", self.test_ascom_discovery),
+                        ("Open Setup Page", self.open_ascom_setup_page)])
+            ttk.Checkbutton(ascom, text="Start the server when the app opens",
+                            variable=self.auto_start_ascom).pack(anchor="w", pady=(0, self._px(6)))
+            self._hint(ascom, "NINA and other Alpaca clients find this device automatically "
+                              "(UDP discovery on port 32227). To add it by hand, use this "
+                              "computer's address with the port and device number above.")
         else:
-            # Show message if Flask is not available
-            flask_frame = tk.LabelFrame(tab_config, text="ASCOM Alpaca Safety Monitor", padx=5, pady=5)
-            flask_frame.pack(fill="x", padx=10, pady=5)
+            self._hint(ascom, "Requires Flask and Flask-CORS. Install them with "
+                              "pip install flask flask-cors, then restart the app.")
 
-            tk.Label(flask_frame,
-                    text="ASCOM Alpaca functionality requires Flask and Flask-CORS.\n"
-                         "Run: pip install flask flask-cors",
-                    fg="red", justify=tk.LEFT).pack(anchor="w")
+        logging_section = self._section(right, "Logging")
+        logging_section.pack(fill="x", pady=(gap, 0))
+        ttk.Checkbutton(logging_section, text="Write a log file",
+                        variable=self.log_enabled,
+                        command=self.on_log_enabled_changed).pack(anchor="w", pady=(0, self._px(6)))
+        entry, buttons = self._field_row(logging_section, "Log file", self.log_path,
+                                         [("Browse…", self.browse_log_file)])
+        self._enable_with(self.log_enabled, entry, *buttons)
 
-        # ── Tab 4: Notifications ─────────────────────────────────────────────
-        tab_notif = ttk.Frame(notebook)
-        notebook.add(tab_notif, text="Notifications")
+    def _build_notifications_tab(self):
+        tab, (left, right) = self._new_tab("notifications", "Notifications")
+        gap = self._px(12)
 
-        # Stale image notification section
-        stale_frame = tk.LabelFrame(tab_notif, text="Stale Image", padx=5, pady=5)
-        stale_frame.pack(fill="x", padx=10, pady=5)
+        def webhook(section, enabled_var, url_var, check_text, extra=None):
+            ttk.Checkbutton(section, text=check_text,
+                            variable=enabled_var).pack(anchor="w", pady=(0, self._px(6)))
+            widgets = list(extra or [])
+            entry, buttons = self._field_row(section, "Webhook URL", url_var,
+                                             [("Test", lambda: self._test_webhook(url_var))])
+            self._enable_with(enabled_var, entry, *buttons, *widgets)
 
-        tk.Checkbutton(stale_frame, text="Notify when the latest image has not changed for X minutes",
-                       variable=self.notif_stale_enabled, command=self.save_settings).pack(anchor="w")
+        stale = self._section(left, "Stale Image")
+        stale.pack(fill="x")
+        threshold = ttk.Frame(stale)
+        threshold.pack(fill="x", pady=(0, self._px(6)))
+        ttk.Label(threshold, text="An image is stale after").pack(side=tk.LEFT)
+        ttk.Entry(threshold, textvariable=self.notif_stale_minutes, width=5).pack(
+            side=tk.LEFT, padx=self._px(6))
+        ttk.Label(threshold, text="minutes without changing.").pack(side=tk.LEFT)
+        ttk.Label(stale, text="While the image is stale, report:").pack(anchor="w")
+        ttk.Radiobutton(stale, text="The model's classification of the last frame",
+                        variable=self.stale_image_action,
+                        value=STALE_ACTION_KEEP).pack(anchor="w", padx=(self._px(12), 0))
+        ttk.Radiobutton(stale, text="CLOSED (fail-safe), since a frozen frame can't be trusted",
+                        variable=self.stale_image_action,
+                        value=STALE_ACTION_CLOSED).pack(anchor="w", padx=(self._px(12), 0))
+        ttk.Separator(stale).pack(fill="x", pady=self._px(8))
+        webhook(stale, self.notif_stale_enabled, self.notif_stale_url,
+                "Send a webhook when the image goes stale")
 
-        stale_min_frame = tk.Frame(stale_frame)
-        stale_min_frame.pack(fill="x", pady=2)
-        tk.Label(stale_min_frame, text="Stale threshold (minutes):").pack(side=tk.LEFT)
-        tk.Entry(stale_min_frame, textvariable=self.notif_stale_minutes, width=6).pack(side=tk.LEFT, padx=(5, 0))
+        opened = self._section(left, "Roof Opened")
+        opened.pack(fill="x", pady=(gap, 0))
+        webhook(opened, self.notif_open_enabled, self.notif_open_url,
+                "Send a webhook when the roof opens")
 
-        stale_action_frame = tk.Frame(stale_frame)
-        stale_action_frame.pack(fill="x", pady=2)
-        tk.Label(stale_action_frame,
-                 text="While the image is stale (camera frozen), report:").pack(anchor="w")
-        tk.Radiobutton(stale_action_frame,
-                       text="The model's classification of the last frame",
-                       variable=self.stale_image_action, value=STALE_ACTION_KEEP,
-                       command=self.save_settings).pack(anchor="w", padx=(15, 0))
-        tk.Radiobutton(stale_action_frame,
-                       text="CLOSED (fail-safe) — don't trust a frozen frame",
-                       variable=self.stale_image_action, value=STALE_ACTION_CLOSED,
-                       command=self.save_settings).pack(anchor="w", padx=(15, 0))
+        heartbeat = self._section(right, "Heartbeat")
+        heartbeat.pack(fill="x")
+        ttk.Checkbutton(heartbeat, text="Send a heartbeat while monitoring",
+                        variable=self.notif_heartbeat_enabled).pack(anchor="w", pady=(0, self._px(6)))
+        interval = ttk.Frame(heartbeat)
+        interval.pack(fill="x", pady=(0, self._px(8)))
+        ttk.Label(interval, text="Every").pack(side=tk.LEFT)
+        interval_entry = ttk.Entry(interval, textvariable=self.notif_heartbeat_minutes, width=5)
+        interval_entry.pack(side=tk.LEFT, padx=self._px(6))
+        ttk.Label(interval, text="minutes").pack(side=tk.LEFT)
+        entry, buttons = self._field_row(heartbeat, "Webhook URL", self.notif_heartbeat_url,
+                                         [("Test", lambda: self._test_webhook(self.notif_heartbeat_url))])
+        self._enable_with(self.notif_heartbeat_enabled, interval_entry, entry, *buttons)
+        self._hint(heartbeat, "Skipped while the image is stale, so a missing heartbeat means "
+                              "monitoring or the camera needs attention.")
 
-        stale_url_outer = tk.Frame(stale_frame)
-        stale_url_outer.pack(fill="x", pady=2)
-        tk.Label(stale_url_outer, text="Webhook URL:").pack(anchor="w")
-        stale_url_inner = tk.Frame(stale_url_outer)
-        stale_url_inner.pack(fill="x")
-        tk.Entry(stale_url_inner, textvariable=self.notif_stale_url, width=40).pack(side=tk.LEFT, fill="x", expand=True)
-        tk.Button(stale_url_inner, text="Test",
-                  command=lambda: self._test_webhook(self.notif_stale_url)).pack(side=tk.RIGHT, padx=(5, 0))
+        closed = self._section(right, "Roof Closed")
+        closed.pack(fill="x", pady=(gap, 0))
+        webhook(closed, self.notif_closed_enabled, self.notif_closed_url,
+                "Send a webhook when the roof closes")
 
-        # Roof open notification section
-        open_frame = tk.LabelFrame(tab_notif, text="Roof Open Notification", padx=5, pady=5)
-        open_frame.pack(fill="x", padx=10, pady=5)
+        self._hint(right,"Webhooks are sent as an HTTP POST with a JSON body containing event, "
+                         "status and timestamp, plus stale_minutes for stale-image events. "
+                         "Open and closed events fire only when the status changes.",
+                   pady=(gap, 0))
 
-        tk.Checkbutton(open_frame, text="Notify when the roof opens",
-                       variable=self.notif_open_enabled, command=self.save_settings).pack(anchor="w")
+    def _build_utilities_tab(self):
+        _tab, (left, _right) = self._new_tab("utilities", "Utilities")
+        fits_section = self._section(left, "FITS to PNG")
+        fits_section.pack(fill="x")
+        self._hint(fits_section, "Convert FITS frames from an astronomy camera to PNG, for example "
+                                 "to use them as training images. Debayering and stretching are "
+                                 "optional.", pady=(0, self._px(8)))
+        button = ttk.Button(fits_section, text="Convert FITS Files…", command=self.convert_fits_to_png)
+        button.pack(anchor="w")
+        if not FITS_AVAILABLE:
+            button.state(["disabled"])
+            self._hint(fits_section, "Requires astropy: pip install astropy",
+                       pady=(self._px(6), 0))
 
-        open_url_outer = tk.Frame(open_frame)
-        open_url_outer.pack(fill="x", pady=2)
-        tk.Label(open_url_outer, text="Webhook URL:").pack(anchor="w")
-        open_url_inner = tk.Frame(open_url_outer)
-        open_url_inner.pack(fill="x")
-        tk.Entry(open_url_inner, textvariable=self.notif_open_url, width=40).pack(side=tk.LEFT, fill="x", expand=True)
-        tk.Button(open_url_inner, text="Test",
-                  command=lambda: self._test_webhook(self.notif_open_url)).pack(side=tk.RIGHT, padx=(5, 0))
+    # ── Window state, autosave and small status helpers ───────────────────────
 
-        # Roof closed notification section
-        closed_frame = tk.LabelFrame(tab_notif, text="Roof Closed Notification", padx=5, pady=5)
-        closed_frame.pack(fill="x", padx=10, pady=5)
+    def _select_tab(self, key):
+        tab = getattr(self, "_tabs", {}).get(key)
+        if tab is not None:
+            self.notebook.select(tab)
 
-        tk.Checkbutton(closed_frame, text="Notify when the roof closes",
-                       variable=self.notif_closed_enabled, command=self.save_settings).pack(anchor="w")
+    def _on_tab_changed(self, _event=None):
+        self._last_tab = self.notebook.index(self.notebook.select())
+        self._schedule_save()
 
-        closed_url_outer = tk.Frame(closed_frame)
-        closed_url_outer.pack(fill="x", pady=2)
-        tk.Label(closed_url_outer, text="Webhook URL:").pack(anchor="w")
-        closed_url_inner = tk.Frame(closed_url_outer)
-        closed_url_inner.pack(fill="x")
-        tk.Entry(closed_url_inner, textvariable=self.notif_closed_url, width=40).pack(side=tk.LEFT, fill="x", expand=True)
-        tk.Button(closed_url_inner, text="Test",
-                  command=lambda: self._test_webhook(self.notif_closed_url)).pack(side=tk.RIGHT, padx=(5, 0))
+    def _restore_window_state(self):
+        """Size the window to its content, then reapply the saved size and tab."""
+        self.root.update_idletasks()
+        min_w, min_h = self.root.winfo_reqwidth(), self.root.winfo_reqheight()
+        self.root.minsize(min_w, min_h)
 
-        # Heartbeat notification section
-        heartbeat_frame = tk.LabelFrame(tab_notif, text="Heartbeat Notification", padx=5, pady=5)
-        heartbeat_frame.pack(fill="x", padx=10, pady=5)
+        match = re.fullmatch(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", getattr(self, "_window_geometry", "") or "")
+        if match:
+            w, h, x, y = (int(v) for v in match.groups())
+            w, h = max(w, min_w), max(h, min_h)
+            on_screen = (0 <= x < self.root.winfo_screenwidth() - 80
+                         and 0 <= y < self.root.winfo_screenheight() - 80)
+            self.root.geometry(f"{w}x{h}+{x}+{y}" if on_screen else f"{w}x{h}")
+        if getattr(self, "_window_zoomed", False):
+            try:
+                self.root.state("zoomed")
+            except tk.TclError:
+                pass
 
-        tk.Checkbutton(heartbeat_frame,
-                       text="Send periodic heartbeat while monitoring is active (image must not be stale)",
-                       variable=self.notif_heartbeat_enabled, command=self.save_settings).pack(anchor="w")
+        tab_index = getattr(self, "_last_tab", None)
+        if not self.model and not self.model_path.get():
+            # First run: there is nothing to monitor with until a model exists
+            self._select_tab("training")
+        elif isinstance(tab_index, int) and 0 <= tab_index < len(self.notebook.tabs()):
+            self.notebook.select(tab_index)
 
-        hb_min_frame = tk.Frame(heartbeat_frame)
-        hb_min_frame.pack(fill="x", pady=2)
-        tk.Label(hb_min_frame, text="Interval (minutes):").pack(side=tk.LEFT)
-        tk.Entry(hb_min_frame, textvariable=self.notif_heartbeat_minutes, width=6).pack(side=tk.LEFT, padx=(5, 0))
+    def _remember_window_state(self):
+        try:
+            self._window_zoomed = self.root.state() == "zoomed"
+            if self.root.state() == "normal":
+                self._window_geometry = self.root.geometry()
+        except tk.TclError:
+            pass
 
-        hb_url_outer = tk.Frame(heartbeat_frame)
-        hb_url_outer.pack(fill="x", pady=2)
-        tk.Label(hb_url_outer, text="Webhook URL:").pack(anchor="w")
-        hb_url_inner = tk.Frame(hb_url_outer)
-        hb_url_inner.pack(fill="x")
-        tk.Entry(hb_url_inner, textvariable=self.notif_heartbeat_url, width=40).pack(side=tk.LEFT, fill="x", expand=True)
-        tk.Button(hb_url_inner, text="Test",
-                  command=lambda: self._test_webhook(self.notif_heartbeat_url)).pack(side=tk.RIGHT, padx=(5, 0))
+    def _schedule_save(self, *_):
+        """Save settings once edits pause, rather than on every keystroke."""
+        if self._save_after_id is not None:
+            self.root.after_cancel(self._save_after_id)
+        self._save_after_id = self.root.after(SETTINGS_SAVE_DELAY_MS, self._flush_settings)
 
-        # Help text
-        notif_help_frame = tk.Frame(tab_notif)
-        notif_help_frame.pack(fill="x", padx=10, pady=5)
-        tk.Label(notif_help_frame,
-                 text=("Webhooks are HTTP POST requests with a JSON body.\n"
-                       "Payload fields: event, status, timestamp (and stale_minutes for stale events).\n"
-                       "Open/closed notifications fire only on transitions (not every cycle).\n"
-                       "Heartbeat is suppressed when the image is stale (uses the Stale threshold above)."),
-                 fg="darkgreen", font=("Arial", 8), justify=tk.LEFT).pack(anchor="w")
+    def _flush_settings(self):
+        if getattr(self, "_save_after_id", None) is not None:
+            self.root.after_cancel(self._save_after_id)
+        self._save_after_id = None
+        self.save_settings()
 
-        # ── Tab 5: Utilities ──────────────────────────────────────────────────
-        tab_utils = ttk.Frame(notebook)
-        notebook.add(tab_utils, text="Utilities")
+    def _schedule_observation_refresh(self, *_):
+        if self._obs_refresh_after_id is not None:
+            self.root.after_cancel(self._obs_refresh_after_id)
+        self._obs_refresh_after_id = self.root.after(500, self._refresh_observation_now)
 
-        utils_frame = tk.LabelFrame(tab_utils, text="Utilities", padx=5, pady=5)
-        utils_frame.pack(fill="x", padx=10, pady=5)
+    def _refresh_observation_now(self):
+        self._obs_refresh_after_id = None
+        self.update_observation_window_display()
 
-        tk.Button(utils_frame, text="Convert FITS to PNG", command=self.convert_fits_to_png).pack(side=tk.LEFT, padx=5)
+    def _set_activity(self, text, fg=COLOR_MUTED, clear_after_ms=10000):
+        """Show a short-lived message at the bottom of the window."""
+        if not hasattr(self, "activity_label"):
+            return
+        self.activity_label.config(text=text, fg=fg)
+        if self._activity_after_id is not None:
+            self.root.after_cancel(self._activity_after_id)
+            self._activity_after_id = None
+        if clear_after_ms:
+            self._activity_after_id = self.root.after(
+                clear_after_ms, lambda: self.activity_label.config(text=""))
+
+    def _on_close(self):
+        """Confirm before a close that would stop monitoring, then shut down cleanly."""
+        if self.monitoring_active and not messagebox.askyesno(
+                "Quit Synthetic RoofStatusFile",
+                "Monitoring is running. If you quit, the roof status file stops "
+                "updating and ASCOM clients lose the safety monitor.\n\nQuit anyway?",
+                icon=messagebox.WARNING, default=messagebox.NO, parent=self.root):
+            return
+        self._remember_window_state()
+        self._flush_settings()
+        if self._monitor_stop_event is not None:
+            self._monitor_stop_event.set()
+        if self.ascom_server:
+            try:
+                self.ascom_server.stop()
+            except Exception:
+                pass
+        if self._preview_tmp_path:
+            try:
+                os.unlink(self._preview_tmp_path)
+            except OSError:
+                pass
+        self.root.destroy()
+
+    def _update_model_display(self):
+        """Show which model is loaded, on the Training tab and in the status bar."""
+        if not hasattr(self, "model_status_label"):
+            return
+        for button in self._model_required_buttons:
+            self._set_enabled(button, self.model is not None)
+        path = self.model_path.get()
+        if self.model is None:
+            self.model_status_label.config(text="No model loaded", fg=COLOR_WARN)
+            self.model_path_label.config(
+                text="Train a model from your labelled images, or load a .joblib file.")
+            self.statusbar_model_label.config(text="No model", fg=COLOR_WARN)
+            return
+        name = os.path.basename(path) if path else "Unsaved model"
+        self.model_status_label.config(text=f"Loaded: {name}", fg=COLOR_OK)
+        self.model_path_label.config(
+            text=path or "Not saved yet. Use Save Model As… to keep it.")
+        self.statusbar_model_label.config(text=f"Model: {self._short_source(name, 32)}",
+                                          fg=COLOR_MUTED)
+
+    def toggle_ascom_server(self):
+        if self.ascom_server:
+            self.stop_ascom_server()
+        else:
+            self.start_ascom_server()
+        self._update_ascom_display()
+
+    def _update_ascom_display(self):
+        """Refresh the ASCOM state on the Configuration tab and in the status bar."""
+        if not hasattr(self, "statusbar_ascom_label"):
+            return
+        server = self.ascom_server
+        if not FLASK_AVAILABLE:
+            self.statusbar_ascom_label.config(text="ASCOM unavailable", fg=COLOR_MUTED)
+            return
+        if server is None:
+            bar, detail, fg = "ASCOM off", "Server stopped.", COLOR_MUTED
+        elif not server.connected:
+            bar = "ASCOM waiting for client"
+            detail = f"Running on port {server.port}, device {server.device_number}. No client connected."
+            fg = COLOR_TEXT
+        else:
+            safe, error = server.reported_safety()
+            bar = f"ASCOM {'Safe' if safe else 'Unsafe'}"
+            detail = (f"Running on port {server.port}, device {server.device_number}. "
+                      f"Client connected; reporting {'Safe' if safe else 'Unsafe'}")
+            detail += f" ({error})." if error and not safe else "."
+            fg = COLOR_OK if safe else COLOR_WARN
+        self.statusbar_ascom_label.config(text=bar, fg=fg if server else COLOR_MUTED)
+        if hasattr(self, "ascom_status_label"):
+            self.ascom_status_label.config(text=detail, fg=fg)
+            running = server is not None
+            self.ascom_toggle_btn.config(text="Stop Server" if running else "Start Server")
+            self._set_enabled(self.ascom_port_entry, not running)
+            self._set_enabled(self.ascom_device_entry, not running)
+            self._set_enabled(self.ascom_discovery_btn, running)
+            self._set_enabled(self.ascom_setup_btn, running)
+
+    def _render_roof_status(self):
+        """Refresh the large roof status on the Monitoring tab from the current state."""
+        if not hasattr(self, "roof_status_label"):
+            return
+        snapshot = self._last_classification
+        override = self.override_active
+        if override:
+            status, note, fg = override, "Manual override", COLOR_WARN
+        elif self._failsafe_active:
+            status = "CLOSED"
+            note, fg = "Fail-safe: no valid classification for several minutes", COLOR_WARN
+        elif snapshot:
+            status = snapshot[1]
+            reason = getattr(self, "_last_status_reason", "")
+            note = reason or "Classified by the model"
+            fg = COLOR_WARN if reason else COLOR_MUTED
+            age = (datetime.now(timezone.utc) - snapshot[2]).total_seconds()
+            if not self.monitoring_active:
+                note += f". Monitoring is off; this result is {self._format_elapsed(age)} old"
+            elif age > CLASSIFICATION_MAX_AGE_SECONDS:
+                note += f". Result is {self._format_elapsed(age)} old"
+                fg = COLOR_WARN
+        else:
+            status = None
+            fg = COLOR_MUTED
+            if self.model is None:
+                note = "No model loaded. Train or load one on the Training & Model tab."
+            elif self.monitoring_active:
+                note = "Waiting for the first check…"
+            else:
+                note = "Not monitoring"
+        self.roof_status_label.config(
+            text=status or "—", fg=ROOF_STATUS_COLORS.get(status, COLOR_MUTED))
+        self.roof_status_note.config(text=note, fg=fg)
+
+    def _sync_monitoring_controls(self):
+        button = getattr(self, "statusbar_toggle_btn", None)
+        if button is not None:
+            button.config(text="Stop Monitoring" if self.monitoring_active else "Start Monitoring")
 
     def _get_training_class_folder(self, label, base=None):
         """Return the full path to a training class subfolder (open/closed/unclassified/other).
@@ -1421,10 +1706,10 @@ class RoofClassifierApp:
             except Exception as e:
                 print(f"Error processing {path}: {e}")
 
-        message = f"{count} {label} frame(s) saved."
+        message = f"Added {count} {label} image{'s' if count != 1 else ''}"
         if duplicates > 0:
-            message += f" {duplicates} duplicate(s) skipped."
-        messagebox.showinfo("Saved", message)
+            message += f"; skipped {duplicates} already in the training set"
+        self._set_activity(message + ".")
         self.update_training_stats()
 
     def update_training_stats(self):
@@ -1439,22 +1724,29 @@ class RoofClassifierApp:
         closed_count = _count("closed")
         unclassified_count = _count("unclassified")
 
-        text = f"Training set: Open: {open_count}, Closed: {closed_count}"
+        text = f"{open_count} open  ·  {closed_count} closed"
         if unclassified_count:
-            text += f", Unclassified: {unclassified_count}"
+            text += f"  ·  {unclassified_count} waiting for review"
         self.stats_label.config(text=text)
 
     def clear_training_data(self):
         """Clear all training data"""
-        result = messagebox.askyesno("Confirm", "Are you sure you want to delete all training data?")
-        if not result:
+        folders = [self._get_training_class_folder(label) for label in ("open", "closed")]
+        if not any(os.path.isdir(folder) for folder in folders):
+            messagebox.showinfo("Clear Training Data", "There is no training data to clear.")
+            return
+        if not messagebox.askyesno(
+                "Clear Training Data",
+                "Permanently delete every image in these folders?\n\n"
+                + "\n".join(os.path.abspath(folder) for folder in folders)
+                + "\n\nUnclassified images are kept. This cannot be undone.",
+                icon=messagebox.WARNING, default=messagebox.NO):
             return
 
-        for label in ["open", "closed"]:
-            folder = self._get_training_class_folder(label)
+        for folder in folders:
             if os.path.isdir(folder):
                 shutil.rmtree(folder)
-        messagebox.showinfo("Cleared", "All training data has been cleared.")
+        self._set_activity("Training data cleared.")
         self.update_training_stats()
 
     def _load_training_data(self):
@@ -1482,16 +1774,19 @@ class RoofClassifierApp:
     def train_model(self):
         X, y, skipped = self._load_training_data()
         if not X:
-            messagebox.showerror("Error", "No training data found.")
+            messagebox.showerror(
+                "No Training Data",
+                "There are no labelled images to train on. Add some with "
+                "\"Add Open Images\" and \"Add Closed Images\".")
             return
         if len(set(y)) < 2:
             # LogisticRegression.fit raises on a single class, which used to
             # escape the button handler with no message at all.
             missing = "closed" if 1 in y else "open"
             messagebox.showerror(
-                "Error",
+                "Not Enough Training Data",
                 f"Training needs both open and closed examples, but there are no "
-                f"{missing} images. Add some with \"Add Frame ({missing.capitalize()})\".")
+                f"{missing} images. Add some with \"Add {missing.capitalize()} Images\".")
             return
         clf = LogisticRegression(max_iter=1000)
         clf.fit(X, y)
@@ -1499,24 +1794,31 @@ class RoofClassifierApp:
         # Show training summary
         open_count = sum(1 for label in y if label == 1)
         closed_count = sum(1 for label in y if label == 0)
-        message = f"Model trained successfully!\nTraining samples: Open: {open_count}, Closed: {closed_count}"
+        message = f"Model trained on {open_count} open and {closed_count} closed images."
+        # Things the user needs to act on. A clean run is reported in the status
+        # bar; only these warrant a dialog.
+        notes = []
         if skipped:
-            message += f"\nSkipped {len(skipped)} unreadable image(s): {', '.join(skipped[:5])}"
-            if len(skipped) > 5:
-                message += ", ..."
+            note = f"Skipped {len(skipped)} unreadable image(s): {', '.join(skipped[:5])}"
+            notes.append(note + (", ..." if len(skipped) > 5 else ""))
 
         # Keep the trained model even if saving it fails - it is still usable.
         self.model = clf
         if self.model_path.get():
             try:
                 dump(clf, self.model_path.get())
-                message += f"\nModel saved to {self.model_path.get()}"
+                message += f" Saved to {os.path.basename(self.model_path.get())}."
                 self.save_settings()
             except Exception as e:
-                message += f"\nWARNING: could not save the model to {self.model_path.get()}: {e}"
+                notes.append(f"WARNING: could not save the model to {self.model_path.get()}: {e}")
         else:
-            message += "\n(Model not saved - specify a path to save)"
-        messagebox.showinfo("Model Trained", message)
+            notes.append("The model has not been saved. Use Save Model As… to keep it.")
+        self._update_model_display()
+        self._render_roof_status()
+        if notes:
+            messagebox.showinfo("Model Trained", message + "\n\n" + "\n\n".join(notes))
+        else:
+            self._set_activity(message)
 
     @staticmethod
     def _load_model_file(path):
@@ -1538,16 +1840,22 @@ class RoofClassifierApp:
         return model
 
     def load_model(self):
-        path = filedialog.askopenfilename(filetypes=[("Joblib model", "*.joblib")])
+        current = self.model_path.get()
+        path = filedialog.askopenfilename(
+            title="Load Model",
+            filetypes=[("Joblib model", "*.joblib"), ("All files", "*.*")],
+            initialdir=os.path.dirname(os.path.abspath(current)) if current else os.getcwd())
         if path:
             try:
                 self.model = self._load_model_file(path)
             except Exception as e:
-                messagebox.showerror("Error", f"Failed to load model: {e}")
+                messagebox.showerror("Could Not Load Model", f"Failed to load model: {e}")
                 return
             self.model_path.set(path)
             self.save_settings()
-            messagebox.showinfo("Loaded", f"Loaded model from {path}")
+            self._update_model_display()
+            self._render_roof_status()
+            self._set_activity(f"Loaded model {os.path.basename(path)}.")
 
     def prep_image(self, path):
         """Load *path* as the small grayscale array the model works on.
@@ -1569,7 +1877,7 @@ class RoofClassifierApp:
         user to choose a folder.
         """
         if not self.model:
-            messagebox.showerror("Error", "Load or train a model first.")
+            messagebox.showerror("No Model Loaded", "Train or load a model before validating it.")
             return
 
         fixed = self.validation_set_path.get().strip()
@@ -1583,59 +1891,114 @@ class RoofClassifierApp:
         try:
             X_val, y_val, file_names = self._load_validation_data(folder)
         except ValueError as e:
-            messagebox.showerror("Error", str(e))
+            messagebox.showerror("Validation Set Error", str(e))
             return
 
-        # Make predictions
-        X_val = np.array(X_val)
-        y_pred = self.model.predict(X_val)
-        
-        # Calculate accuracy
+        y_pred = self.model.predict(np.array(X_val))
         accuracy = accuracy_score(y_val, y_pred)
-        
-        # Create detailed results window
-        self.show_validation_results(y_val, y_pred, file_names, accuracy)
+        self.show_validation_results(y_val, y_pred, file_names, accuracy, folder)
 
-    def show_validation_results(self, y_true, y_pred, file_names, accuracy):
+    def _scrolled_tree(self, parent, columns, scroll_x=False, scroll_y=True):
+        """A Treeview with scrollbars, packed into *parent*. Returns the tree."""
+        frame = ttk.Frame(parent)
+        frame.pack(fill="both", expand=True)
+        tree = ttk.Treeview(frame, columns=[key for key, _title, _width in columns],
+                            show="headings", selectmode="browse")
+        for key, title, width in columns:
+            tree.heading(key, text=title, anchor="w")
+            tree.column(key, width=self._px(width), anchor="w", stretch=key == columns[0][0])
+        tree.grid(row=0, column=0, sticky="nsew")
+        if scroll_y:
+            vertical = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+            tree.configure(yscrollcommand=vertical.set)
+            vertical.grid(row=0, column=1, sticky="ns")
+        if scroll_x:
+            horizontal = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
+            tree.configure(xscrollcommand=horizontal.set)
+            horizontal.grid(row=1, column=0, sticky="ew")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        return tree
+
+    def _open_image_on_double_click(self, tree, folder):
+        """Open the double-clicked row's image (first column is its path under *folder*)."""
+        if not folder or not hasattr(os, "startfile"):
+            return
+
+        def on_double_click(_event):
+            selected = tree.focus()
+            if not selected:
+                return
+            path = os.path.join(folder, tree.item(selected, "values")[0])
+            try:
+                os.startfile(path)
+            except OSError as e:
+                messagebox.showerror("Could Not Open Image", str(e), parent=tree)
+
+        tree.bind("<Double-1>", on_double_click)
+
+    def show_validation_results(self, y_true, y_pred, file_names, accuracy, folder=None):
         """Display validation results in a new window"""
-        results_window = tk.Toplevel(self.root)
-        results_window.title("Validation Results")
-        results_window.geometry("600x400")
-        
-        # Summary
-        summary_frame = tk.Frame(results_window)
-        summary_frame.pack(fill="x", padx=10, pady=5)
-        
-        tk.Label(summary_frame, text=f"Overall Accuracy: {accuracy:.3f} ({accuracy*100:.1f}%)", 
-                font=("Arial", 12, "bold")).pack()
-        
-        # Confusion matrix
-        cm = confusion_matrix(y_true, y_pred)
-        tk.Label(summary_frame, text=f"Confusion Matrix:").pack()
-        tk.Label(summary_frame, text=f"True Closed/Predicted Closed: {cm[0,0]}, True Closed/Predicted Open: {cm[0,1]}").pack()
-        tk.Label(summary_frame, text=f"True Open/Predicted Closed: {cm[1,0]}, True Open/Predicted Open: {cm[1,1]}").pack()
-        
-        # Detailed results
-        tk.Label(results_window, text="Detailed Results:").pack()
-        
-        # Create scrollable text widget
-        text_frame = tk.Frame(results_window)
-        text_frame.pack(fill="both", expand=True, padx=10, pady=5)
-        
-        text_widget = tk.Text(text_frame, wrap=tk.WORD)
-        scrollbar = tk.Scrollbar(text_frame, orient="vertical", command=text_widget.yview)
-        text_widget.configure(yscrollcommand=scrollbar.set)
-        
-        # Show individual predictions
-        for i, (true_label, pred_label, filename) in enumerate(zip(y_true, y_pred, file_names)):
-            true_str = "OPEN" if true_label == 1 else "CLOSED"
-            pred_str = "OPEN" if pred_label == 1 else "CLOSED"
-            correct = "✓" if true_label == pred_label else "✗"
-            text_widget.insert(tk.END, f"{correct} {filename}: True={true_str}, Predicted={pred_str}\n")
-            
-        text_widget.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        text_widget.config(state=tk.DISABLED)
+        win = self._make_dialog("Validation Results", min_size=(520, 380))
+        body = ttk.Frame(win, padding=self._px(14))
+        body.pack(fill="both", expand=True)
+
+        total = len(y_true)
+        mistakes = sum(1 for t, p in zip(y_true, y_pred) if t != p)
+
+        header = ttk.Frame(body)
+        header.pack(fill="x", pady=(0, self._px(12)))
+        tk.Label(header, text=f"{accuracy * 100:.1f}%", font=self.font_status,
+                 fg=COLOR_OK if mistakes == 0 else COLOR_TEXT).pack(side=tk.LEFT, anchor="n")
+        summary = ttk.Frame(header)
+        summary.pack(side=tk.LEFT, padx=(self._px(12), 0), anchor="n", pady=(self._px(4), 0))
+        ttk.Label(summary, text="Accuracy", style="Heading.TLabel").pack(anchor="w")
+        ttk.Label(summary, text=f"{total - mistakes} of {total} images classified correctly").pack(anchor="w")
+
+        # Rows are the true class, columns the prediction. Fixed labels keep the
+        # matrix 2x2 even when the validation set holds only one class.
+        (tp, fn), (fp, tn) = confusion_matrix(y_true, y_pred, labels=[1, 0])
+        matrix = ttk.Frame(header)
+        matrix.pack(side=tk.RIGHT, anchor="n")
+        cells = [("", "Predicted OPEN", "Predicted CLOSED"),
+                 ("Actually OPEN", tp, fn),
+                 ("Actually CLOSED", fp, tn)]
+        for r, row in enumerate(cells):
+            for c, value in enumerate(row):
+                wrong = (r, c) in ((1, 2), (2, 1)) and value
+                ttk.Label(matrix, text=str(value),
+                          font=self.font_bold if wrong else None,
+                          foreground=COLOR_ERROR if wrong else "",
+                          style="Muted.TLabel" if r == 0 or c == 0 else "TLabel").grid(
+                    row=r, column=c, sticky="e" if c else "w", padx=(self._px(10), 0), pady=1)
+
+        controls = ttk.Frame(body)
+        controls.pack(fill="x", pady=(0, self._px(6)))
+        only_mistakes = tk.BooleanVar(value=mistakes > 0)
+        ttk.Checkbutton(controls, text=f"Show only mistakes ({mistakes})",
+                        variable=only_mistakes, command=lambda: fill()).pack(side=tk.LEFT)
+        if folder and hasattr(os, "startfile"):
+            ttk.Label(controls, text="Double-click an image to open it.",
+                      style="Muted.TLabel").pack(side=tk.RIGHT)
+
+        tree = self._scrolled_tree(body, [("file", "Image", 320), ("actual", "Actual", 90),
+                                          ("predicted", "Predicted", 90), ("result", "Result", 80)])
+        tree.tag_configure("wrong", foreground=COLOR_ERROR)
+        self._open_image_on_double_click(tree, folder)
+
+        def fill():
+            tree.delete(*tree.get_children())
+            for true_label, pred_label, filename in zip(y_true, y_pred, file_names):
+                correct = true_label == pred_label
+                if only_mistakes.get() and correct:
+                    continue
+                tree.insert("", tk.END, tags=() if correct else ("wrong",), values=(
+                    filename, "OPEN" if true_label == 1 else "CLOSED",
+                    "OPEN" if pred_label == 1 else "CLOSED",
+                    "Correct" if correct else "Wrong"))
+
+        fill()
+        self._center_over_root(win, self._px(680), self._px(520))
 
     def classify_latest_png(self, config=None, max_cache_age=CLASSIFICATION_CACHE_SECONDS):
         """Classify the newest frame and write the roof status file.
@@ -1767,7 +2130,10 @@ class RoofClassifierApp:
 
         # Get secondary source status for comparison
         secondary_status, secondary_time = self.read_secondary_source(config)
-        
+        # Kept for the Monitoring tab, which must not repeat this (possibly
+        # network) read on the UI thread.
+        self._last_secondary = (secondary_status, secondary_time)
+
         # Classify the image
         pred = self.model.predict(img)[0]
         image_status = "OPEN" if pred == 1 else "CLOSED"
@@ -1871,6 +2237,7 @@ class RoofClassifierApp:
             # status file disagree, so report the pass as failed instead.
             return None, "Could not write roof status file"
 
+        self._last_status_reason = override_reason.strip(" ()")
         self._last_classification = (latest, final_status, datetime.now(timezone.utc))
         self._last_good_pass_at = self._last_classification[2]
         if self._failsafe_active:
@@ -1905,17 +2272,10 @@ class RoofClassifierApp:
     def update_monitoring_status(self, filename, status):
         """Update the monitoring status display"""
         if filename and status:
-            # Get secondary source info for display
-            secondary_status, secondary_time = self.read_secondary_source()
-            
-            status_text = f"Last checked: {filename} → {status}"
-            if secondary_status:
-                time_str = secondary_time.strftime("%H:%M:%S UTC") if secondary_time else "Unknown"
-                status_text += f" | Secondary: {secondary_status} ({time_str})"
-            else:
-                status_text += " | Secondary: N/A"
-            
-            self.status_label.config(text=status_text, fg="green")
+            checked = datetime.now().strftime("%H:%M:%S")
+            self.status_label.config(
+                text=f"Last check at {checked}: {self._short_source(filename)}", fg=COLOR_TEXT)
+            self._update_secondary_status_display()
 
             # Update hash/stale display and check for stale warning
             stale_warning = self._update_hash_status_display()
@@ -1923,10 +2283,9 @@ class RoofClassifierApp:
 
             if stale_warning:
                 self.statusbar_label.config(
-                    text=f"⚠ Monitoring: Active — {status} (stale image)", fg="darkorange"
-                )
+                    text=f"● Monitoring: roof {status}, image not changing", fg=COLOR_WARN)
             else:
-                self.statusbar_label.config(text=f"● Monitoring: Active — {status}", fg="green")
+                self.statusbar_label.config(text=f"● Monitoring: roof {status}", fg=COLOR_OK)
         else:
             # *status* carries the reason the pass failed; show it rather than a
             # generic error, so a dead camera URL, an unreadable frame and a
@@ -1935,33 +2294,57 @@ class RoofClassifierApp:
             text = f"Monitoring: {reason}"
             if self._failsafe_active:
                 text += " — status file set to CLOSED (fail-safe)"
-            self.status_label.config(text=text, fg="red")
-            self.statusbar_label.config(text="● Monitoring: Active — Error", fg="red")
+            self.status_label.config(text=text, fg=COLOR_ERROR)
+            self.statusbar_label.config(text="● Monitoring: last check failed", fg=COLOR_ERROR)
+        self._render_roof_status()
+
+    def _update_secondary_status_display(self):
+        """Show the secondary roof status next to the model's, when one is configured."""
+        if not hasattr(self, "secondary_status_label"):
+            return
+        if not self.secondary_source_enabled.get():
+            self._set_secondary_line(None)
+            return
+        # The result from the classification pass that just ran, read on its
+        # worker thread; reading again here could block the UI on a slow URL.
+        secondary_status, secondary_time = getattr(self, "_last_secondary", None) or (None, None)
+        if secondary_status:
+            when = secondary_time.strftime("%H:%M UTC") if secondary_time else "unknown time"
+            self._set_secondary_line(
+                f"Secondary roof status: {secondary_status} (updated {when})", COLOR_TEXT)
+        else:
+            self._set_secondary_line("Secondary roof status: unavailable", COLOR_WARN)
+
+    def _set_secondary_line(self, text, fg=COLOR_TEXT):
+        """Show the secondary-status line with *text*, or remove it when None, so an
+        unused line does not leave a gap in the status card."""
+        label = self.secondary_status_label
+        if text is None:
+            label.pack_forget()
+            return
+        label.config(text=text, fg=fg)
+        if not label.winfo_manager():
+            label.pack(fill="x", before=self._autostart_check)
 
     def update_countdown(self, seconds_remaining):
         """Update the countdown display"""
         if seconds_remaining > 0:
-            self.countdown_label.config(text=f"Next check in: {seconds_remaining}s")
-            
-            # Update observation window display every 5 minutes (300 seconds)
-            if seconds_remaining % 300 == 0:
-                self.update_observation_window_display()
+            self.countdown_label.config(text=f"Next check in {seconds_remaining} s", fg=COLOR_MUTED)
         else:
-            self.countdown_label.config(text="Checking now...")
-            # Update observation window when checking
-            self.update_observation_window_display()
+            self.countdown_label.config(text="Checking now…", fg=COLOR_MUTED)
 
     def clear_monitoring_status(self):
         """Clear the monitoring status when stopped"""
         self.monitoring_active = False
-        self.status_label.config(text="Monitoring: Stopped", fg="gray")
+        self.status_label.config(text="Not monitoring", fg=COLOR_MUTED)
         self.countdown_label.config(text="")
-        self.statusbar_label.config(text="● Monitoring: Off", fg="gray")
-        self.statusbar_toggle_btn.config(text="Start Monitoring")
+        self.statusbar_label.config(text="● Monitoring off", fg=COLOR_MUTED)
+        self._sync_monitoring_controls()
         if hasattr(self, 'hash_status_label'):
-            self.hash_status_label.config(text="Image hash: Not monitoring", fg="gray")
-        if hasattr(self, 'sun_status_label'):
-            self.sun_status_label.config(text="Sun altitude: --", fg="gray")
+            self.hash_status_label.config(text="Image: —", fg=COLOR_MUTED)
+        if hasattr(self, 'secondary_status_label'):
+            self._set_secondary_line(None)
+        self._render_roof_status()
 
     # ── New feature helpers ───────────────────────────────────────────────────
 
@@ -2126,35 +2509,24 @@ class RoofClassifierApp:
             return False
 
         if self.last_new_hash_time is None:
-            self.hash_status_label.config(text="Image hash: Waiting for first check...", fg="gray")
+            self.hash_status_label.config(text="Image: waiting for the first check", fg=COLOR_MUTED)
             return False
 
-        now = datetime.utcnow()
-        elapsed_seconds = (now - self.last_new_hash_time).total_seconds()
-        elapsed_minutes = elapsed_seconds / 60.0
-
-        if elapsed_minutes < 1:
-            elapsed_str = f"{int(elapsed_seconds)}s ago"
-        elif elapsed_minutes < 60:
-            elapsed_str = f"{elapsed_minutes:.1f} min ago"
-        else:
-            elapsed_str = f"{elapsed_minutes / 60.0:.1f} hr ago"
+        elapsed_seconds = (datetime.utcnow() - self.last_new_hash_time).total_seconds()
+        elapsed_str = self._format_elapsed(elapsed_seconds)
 
         stale_minutes = self._stale_threshold_minutes(
             {'notif_stale_minutes': self.notif_stale_minutes.get()})
 
-        is_stale = elapsed_minutes >= stale_minutes
+        is_stale = elapsed_seconds / 60.0 >= stale_minutes
 
         if is_stale:
             self.hash_status_label.config(
-                text=f"⚠ Image last changed: {elapsed_str} (threshold: {stale_minutes:.0f} min)",
-                fg="darkorange",
+                text=f"Image unchanged for {elapsed_str} (stale after {stale_minutes:g} min)",
+                fg=COLOR_WARN,
             )
         else:
-            self.hash_status_label.config(
-                text=f"Image last changed: {elapsed_str}",
-                fg="darkgreen",
-            )
+            self.hash_status_label.config(text=f"Image last changed {elapsed_str} ago", fg=COLOR_TEXT)
         return is_stale
 
     def _update_sun_status_display(self):
@@ -2171,18 +2543,16 @@ class RoofClassifierApp:
 
         if sun_angle is None or threshold is None:
             self.sun_status_label.config(
-                text="⚠ Sun altitude: unknown (treated as UNSAFE)", fg="darkorange")
+                text="Sun altitude unknown, so OPEN is not reported", fg=COLOR_WARN)
             return
 
         if sun_angle < threshold:
             self.sun_status_label.config(
-                text=f"Sun altitude: {sun_angle:.1f}° (safe — below {threshold:.1f}° threshold)",
-                fg="darkgreen",
-            )
+                text=f"Sun at {sun_angle:.1f}°, below the {threshold:g}° limit", fg=COLOR_TEXT)
         else:
             self.sun_status_label.config(
-                text=f"⚠ Sun altitude: {sun_angle:.1f}° (UNSAFE — above {threshold:.1f}° threshold)",
-                fg="darkorange",
+                text=f"Sun at {sun_angle:.1f}°, above the {threshold:g}° limit, so OPEN is not reported",
+                fg=COLOR_WARN,
             )
 
     # ── Manual override of the reported roof status ───────────────────────────
@@ -2274,17 +2644,13 @@ class RoofClassifierApp:
         # Same for the ASCOM flag, which would otherwise wait for its next refresh.
         self._refresh_ascom_safety()
 
-        note = ("The status file has been updated immediately."
-                if written else
-                "WARNING: the status file could not be written — check the output path.")
-        messagebox.showinfo(
-            "Manual Override Active",
-            f"Roof status will be reported as {mode} until {until}.\n\n"
-            f"This applies to the status file and to ASCOM clients. {note}\n\n"
-            "Note: the sun angle guard still applies to the ASCOM 'IsSafe' flag, so a\n"
-            "forced OPEN will not be reported as safe while the sun is above the\n"
-            "configured threshold."
-        )
+        self._render_roof_status()
+        if not written:
+            messagebox.showwarning(
+                "Status File Not Updated",
+                f"The override is active and ASCOM clients see {mode}, but the roof status "
+                f"file could not be written:\n\n{self.output_path.get()}\n\n"
+                "Check the output path on the Configuration tab.")
 
     def clear_manual_override(self):
         """Drop any active override and return to model-driven status."""
@@ -2301,6 +2667,7 @@ class RoofClassifierApp:
         if was and self.logger:
             self.logger.warning(f"Manual override ({was}) cleared — reverting to model output")
         self._update_override_display()
+        self._render_roof_status()
         if was:
             self._refresh_ascom_safety()
             # Re-classify now so the status file stops reporting the cleared override
@@ -2365,28 +2732,34 @@ class RoofClassifierApp:
         """Refresh the Monitoring-tab override status label."""
         if not hasattr(self, "override_status_label"):
             return
+        clear_btn = getattr(self, "override_clear_btn", None)
+        if clear_btn is not None:
+            self._set_enabled(clear_btn, self.override_active is not None)
         if self.override_active is None:
             self.override_status_label.config(
-                text="No override — reporting model output", fg="gray"
-            )
+                text="No override. The model's classification is reported.", fg=COLOR_MUTED,
+                font=self.font_small)
             return
 
         if self.override_expiry is None:
-            detail = "until cleared"
+            detail = "until you clear it"
         else:
-            detail = (f"until {self.override_expiry.strftime('%Y-%m-%d %H:%M')} local "
-                      f"({self._format_override_remaining()})")
+            when = self.override_expiry.strftime(
+                "%H:%M" if self.override_expiry.date() == datetime.now().date() else "%a %H:%M")
+            detail = f"until {when} ({self._format_override_remaining()})"
         self.override_status_label.config(
-            text=f"⚠ OVERRIDE ACTIVE — reporting {self.override_active} {detail}",
-            fg="darkorange",
+            text=f"Override active: reporting {self.override_active} {detail}",
+            fg=COLOR_WARN, font=self.font_bold,
         )
 
     def _tick_override_display(self):
-        """Periodic refresh so the override countdown stays live and expiry is noticed
-        even when monitoring is not running."""
+        """Once-a-second refresh: keeps the override countdown live, notices expiry
+        even when monitoring is not running, and keeps the status displays current."""
         try:
             self.get_manual_override()  # clears the override if it has expired
             self._update_override_display()
+            self._render_roof_status()
+            self._update_ascom_display()
         finally:
             try:
                 self.root.after(1000, self._tick_override_display)
@@ -2413,8 +2786,10 @@ class RoofClassifierApp:
             return tmp_path, camera_url, True, None
 
         folder = self.monitor_path.get() if folder is None else folder
+        if not folder:
+            return None, None, False, "No image folder or camera URL set"
         if not os.path.isdir(folder):
-            return None, None, False, "No model or invalid folder"
+            return None, None, False, f"Image folder not found: {folder}"
 
         try:
             names = os.listdir(folder)
@@ -2441,13 +2816,13 @@ class RoofClassifierApp:
         """Show or hide the preview panel (and stop doing the work when hidden)."""
         self._preview_on = self.preview_enabled.get()
         if self._preview_on:
-            self.preview_holder.pack(pady=2)
-            self.preview_bottom_frame.pack(fill="x", pady=2)
+            self.preview_holder.pack(side=tk.TOP, fill="both", expand=True)
+            self.preview_refresh_btn.state(["!disabled"])
             self.refresh_preview()
         else:
             self.preview_holder.pack_forget()
-            self.preview_bottom_frame.pack_forget()
-        self.save_settings()
+            self.preview_refresh_btn.state(["disabled"])
+            self.preview_caption_label.config(text="Preview hidden", fg=COLOR_MUTED)
 
     def _capture_preview(self, img_path, caption):
         """Scale *img_path* for the Monitoring-tab preview and hand it to the UI thread.
@@ -2465,7 +2840,8 @@ class RoofClassifierApp:
             if img is None:
                 return
             h, w = img.shape[:2]
-            scale = min(_PREVIEW_IMG_MAX_W / w, _PREVIEW_IMG_MAX_H / h, 1.0)
+            max_w, max_h = getattr(self, "_preview_max", (_PREVIEW_IMG_MAX_W, _PREVIEW_IMG_MAX_H))
+            scale = min(max_w / w, max_h / h, 1.0)
             disp = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))))
             tmp_fd, tmp_path = tempfile.mkstemp(suffix=".png")
             os.close(tmp_fd)
@@ -2507,10 +2883,11 @@ class RoofClassifierApp:
         self._preview_tmp_path = tmp_path
         # width/height are character cells for a text label but pixels for an image
         # label, so they must be restated in pixels or the image is clipped.
-        self.preview_label.config(image=tk_img, text="", bg="black",
+        self.preview_label.config(image=tk_img, text="",
                                   width=tk_img.width(), height=tk_img.height())
         self.preview_caption_label.config(
-            text=f"{caption}  —  {datetime.now().strftime('%H:%M:%S')}", fg="darkgreen"
+            text=f"{self._short_source(caption, 56)}  ·  {datetime.now().strftime('%H:%M:%S')}",
+            fg=COLOR_MUTED,
         )
 
         if previous and previous != tmp_path:
@@ -2524,7 +2901,7 @@ class RoofClassifierApp:
         if self._preview_busy:
             return
         self._preview_busy = True
-        self.preview_caption_label.config(text="Loading latest image...", fg="gray")
+        self.preview_caption_label.config(text="Loading the latest image…", fg=COLOR_MUTED)
 
         # Read the Tk variables here, on the UI thread, and hand the plain strings to
         # the worker — Tk variables must not be touched from another thread.
@@ -2539,7 +2916,7 @@ class RoofClassifierApp:
                         self.root.after(
                             0,
                             lambda: self.preview_caption_label.config(
-                                text=f"Preview unavailable: {error}", fg="red"
+                                text=f"No preview: {error}", fg=COLOR_MUTED
                             ),
                         )
                     except Exception:
@@ -2795,16 +3172,28 @@ class RoofClassifierApp:
         """Toggle monitoring on or off from the status bar button"""
         if self.monitoring_active:
             self.stop_monitoring()
-        else:
-            self.start_monitoring()
+            return
+        # Checked only for a manual start. An auto-start at boot must still run
+        # when, say, a network share is not mounted yet: every pass then fails and
+        # the fail-safe reports CLOSED until the folder appears.
+        if self.model and not self.camera_url.get().strip() and not os.path.isdir(self.monitor_path.get()):
+            messagebox.showerror(
+                "No Image Source",
+                "Choose the folder your camera saves images to, or a camera image URL, "
+                "on the Configuration tab.")
+            self._select_tab("config")
+            return
+        self.start_monitoring()
 
     def start_monitoring(self):
         if not self.model:
-            messagebox.showerror("Error", "Load or train a model first.")
+            messagebox.showerror("No Model Loaded",
+                                 "Train a model or load one on the Training & Model tab "
+                                 "before starting monitoring.")
+            self._select_tab("training")
             return
-        
+
         if self.monitoring_active:
-            messagebox.showwarning("Warning", "Monitoring is already active.")
             return
 
         # Validate configuration
@@ -2813,7 +3202,10 @@ class RoofClassifierApp:
             float(self.longitude.get())
             float(self.sun_angle_threshold.get())
         except ValueError:
-            messagebox.showerror("Error", "Please enter valid numeric values for latitude, longitude, and sun angle threshold.")
+            messagebox.showerror("Invalid Observatory Settings",
+                                 "Latitude, longitude and the sun limit must be numbers. "
+                                 "Check them on the Configuration tab.")
+            self._select_tab("config")
             return
         
         # Setup logging with current settings
@@ -2839,11 +3231,12 @@ class RoofClassifierApp:
         self.previous_classified_status = None
         self._in_disagreement = False
         self._last_classification = None
-        self.status_label.config(text="Monitoring: Starting...", fg="blue")
+        self.status_label.config(text="Starting…", fg=COLOR_MUTED)
         self.countdown_label.config(text="")
-        self.statusbar_label.config(text="● Monitoring: Active", fg="green")
-        self.statusbar_toggle_btn.config(text="Stop Monitoring")
+        self.statusbar_label.config(text="● Monitoring: starting", fg=COLOR_OK)
+        self._sync_monitoring_controls()
         self._update_sun_status_display()
+        self._render_roof_status()
         
         if self.logger:
             self.logger.info("Monitoring started")
@@ -2855,7 +3248,6 @@ class RoofClassifierApp:
                 self.logger.info("Secondary source disabled")
         
         threading.Thread(target=self.monitor_loop, args=(stop_event,), daemon=True).start()
-        self.update_observation_window_display()  # Start periodic updates
 
     def stop_monitoring(self):
         """Stop the current run. The UI is reset at once; a pass already in
@@ -2866,33 +3258,16 @@ class RoofClassifierApp:
         if self.logger:
             self.logger.info("Monitoring stopped")
 
-    def browse_model_path(self):
-        """Browse for and load an existing model file"""
-        current_path = self.model_path.get()
-        initial_dir = os.path.dirname(current_path) if current_path else os.getcwd()
-        path = filedialog.askopenfilename(
-            title="Select Model to Load",
-            filetypes=[("Joblib model", "*.joblib"), ("All files", "*.*")],
-            initialdir=initial_dir
-        )
-        if path:
-            try:
-                self.model = self._load_model_file(path)
-                self.model_path.set(path)
-                self.save_settings()
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to load model: {e}")
-
     def save_current_model_as(self):
         """Save the currently loaded model to a new location"""
         if not self.model:
-            messagebox.showerror("Error", "No model is currently loaded. Train or load a model first.")
+            messagebox.showerror("No Model Loaded", "Train or load a model before saving it.")
             return
             
         current_path = self.model_path.get()
         initial_dir = os.path.dirname(current_path) if current_path else os.getcwd()
         path = filedialog.asksaveasfilename(
-            title="Save Current Model As...",
+            title="Save Model As",
             defaultextension=".joblib", 
             filetypes=[("Joblib model", "*.joblib")],
             initialdir=initial_dir
@@ -2900,9 +3275,15 @@ class RoofClassifierApp:
         if path:
             try:
                 dump(self.model, path)
-                messagebox.showinfo("Saved", f"Current model saved to {path}")
             except Exception as e:
-                messagebox.showerror("Error", f"Failed to save model: {e}")
+                messagebox.showerror("Could Not Save Model", f"Failed to save model: {e}")
+                return
+            # The saved file is now the current model: it is reloaded on startup
+            # and the next training run saves over it.
+            self.model_path.set(path)
+            self.save_settings()
+            self._update_model_display()
+            self._set_activity(f"Model saved to {path}.")
 
     def save_model_as(self):
         """Legacy method - redirects to save_current_model_as for compatibility"""
@@ -3001,7 +3382,7 @@ class RoofClassifierApp:
         if not val_folder:
             messagebox.showerror(
                 "No Validation Set",
-                "Please set a Fixed Validation Set Folder in the Model section first."
+                "Choose a fixed validation set folder on the Training & Model tab first."
             )
             return
 
@@ -3035,80 +3416,76 @@ class RoofClassifierApp:
             messagebox.showerror("Benchmark Error", "\n".join(errors))
             return
 
-        self._show_benchmark_results(results, y_val, file_names, errors)
+        self._show_benchmark_results(results, y_val, file_names, errors, val_folder)
 
-    def _show_benchmark_results(self, results, y_true, file_names, errors):
+    def _show_benchmark_results(self, results, y_true, file_names, errors, folder=None):
         """Display a side-by-side benchmark comparison in a Toplevel window."""
-        win = tk.Toplevel(self.root)
-        win.title("Model Benchmark Results")
-        win.geometry("800x550")
-        win.resizable(True, True)
+        win = self._make_dialog("Model Benchmark", min_size=(560, 420))
+        body = ttk.Frame(win, padding=self._px(14))
+        body.pack(fill="both", expand=True)
 
-        # ── Summary table ─────────────────────────────────────────────────────
-        summary_frame = tk.LabelFrame(win, text="Summary", padx=5, pady=5)
-        summary_frame.pack(fill="x", padx=10, pady=5)
+        ttk.Label(body, text=f"{len(results)} model{'s' if len(results) != 1 else ''} "
+                             f"against {len(y_true)} validation images",
+                  style="Heading.TLabel").pack(anchor="w", pady=(0, self._px(8)))
 
-        headers = ["Model", "Accuracy", "TN", "FP", "FN", "TP"]
-        for col, h in enumerate(headers):
-            tk.Label(summary_frame, text=h, font=("Arial", 9, "bold"),
-                     relief="ridge", width=14 if col == 0 else 7,
-                     anchor="w").grid(row=0, column=col, sticky="ew", padx=1, pady=1)
-
+        # ── Summary, best first ───────────────────────────────────────────────
+        summary_holder = ttk.Frame(body, height=self._px(22) * (min(len(results), 6) + 2))
+        summary_holder.pack(fill="x")
+        summary_holder.pack_propagate(False)
+        summary = self._scrolled_tree(summary_holder, [
+            ("model", "Model", 260), ("accuracy", "Accuracy", 90),
+            ("false_open", "Wrongly OPEN", 110), ("false_closed", "Wrongly CLOSED", 110)],
+            scroll_y=len(results) > 6)
+        summary.tag_configure("best", font=self.font_bold)
         best_acc = max(r[1] for r in results) if results else 0.0
-        for row_idx, (name, acc, cm, _, _) in enumerate(results, start=1):
-            if cm.shape == (2, 2):
-                tn, fp, fn, tp = cm[0, 0], cm[0, 1], cm[1, 0], cm[1, 1]
-            else:
-                if self.logger:
-                    self.logger.warning(
-                        f"Unexpected confusion matrix shape {cm.shape} for model '{name}'. "
-                        "Ensure validation data contains both classes."
-                    )
-                tn, fp, fn, tp = "N/A", "N/A", "N/A", "N/A"
-            bold = ("Arial", 9, "bold") if acc == best_acc else ("Arial", 9)
-            fg = "darkgreen" if acc == best_acc else "black"
-            values = [name, f"{acc:.4f} ({acc*100:.1f}%)", tn, fp, fn, tp]
-            for col, val in enumerate(values):
-                tk.Label(summary_frame, text=str(val), font=bold, fg=fg,
-                         relief="ridge", width=14 if col == 0 else 7,
-                         anchor="w").grid(row=row_idx, column=col, sticky="ew", padx=1, pady=1)
+        for name, acc, _cm, y_pred, _path in sorted(results, key=lambda r: -r[1]):
+            false_open = sum(1 for t, p in zip(y_true, y_pred) if t == 0 and p == 1)
+            false_closed = sum(1 for t, p in zip(y_true, y_pred) if t == 1 and p == 0)
+            summary.insert("", tk.END, tags=("best",) if acc == best_acc else (),
+                           values=(name, f"{acc * 100:.1f}%", false_open, false_closed))
+        self._hint(body, "Wrongly OPEN is the costly mistake: the roof reported open while it "
+                         "is closed.", pady=(self._px(4), 0))
 
         if errors:
-            err_label = tk.Label(summary_frame,
-                                 text="Failed: " + "; ".join(errors),
-                                 fg="red", font=("Arial", 8), wraplength=760, justify=tk.LEFT)
-            err_label.grid(row=len(results) + 1, column=0, columnspan=6, sticky="w", pady=(4, 0))
+            tk.Label(body, text="Could not run: " + "; ".join(errors), fg=COLOR_ERROR,
+                     anchor="w", justify=tk.LEFT, wraplength=self._px(640)).pack(
+                fill="x", pady=(self._px(6), 0))
 
         # ── Per-image detail ──────────────────────────────────────────────────
-        detail_frame = tk.LabelFrame(win, text="Per-Image Results", padx=5, pady=5)
-        detail_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        controls = ttk.Frame(body)
+        controls.pack(fill="x", pady=(self._px(14), self._px(6)))
+        ttk.Label(controls, text="Per image", style="Heading.TLabel").pack(side=tk.LEFT)
+        only_disputed = tk.BooleanVar(value=True)
+        ttk.Checkbutton(controls, text="Only images some model got wrong",
+                        variable=only_disputed, command=lambda: fill()).pack(
+            side=tk.LEFT, padx=(self._px(14), 0))
+        if folder and hasattr(os, "startfile"):
+            ttk.Label(controls, text="Double-click an image to open it.",
+                      style="Muted.TLabel").pack(side=tk.RIGHT)
 
-        # Build column headers: File | True | Model1 | Model2 | ...
-        col_headers = ["File", "True"] + [r[0] for r in results]
-        tree = ttk.Treeview(detail_frame, columns=col_headers, show="headings")
-        for ch in col_headers:
-            tree.heading(ch, text=ch)
-            tree.column(ch, width=80 if ch not in ("File",) else 200, anchor="center")
-        tree.column("File", anchor="w")
+        columns = [("file", "Image", 240), ("actual", "Actual", 80)]
+        columns += [(f"m{i}", r[0], 120) for i, r in enumerate(results)]
+        detail = self._scrolled_tree(body, columns, scroll_x=len(results) > 3)
+        detail.tag_configure("disputed", foreground=COLOR_ERROR)
+        self._open_image_on_double_click(detail, folder)
 
-        vertical_scrollbar = ttk.Scrollbar(detail_frame, orient="vertical", command=tree.yview)
-        horizontal_scrollbar = ttk.Scrollbar(detail_frame, orient="horizontal", command=tree.xview)
-        tree.configure(yscrollcommand=vertical_scrollbar.set, xscrollcommand=horizontal_scrollbar.set)
+        def fill():
+            detail.delete(*detail.get_children())
+            for i, (fname, true_val) in enumerate(zip(file_names, y_true)):
+                preds = []
+                any_wrong = False
+                for _, _, _, y_pred, _ in results:
+                    wrong = y_pred[i] != true_val
+                    any_wrong = any_wrong or wrong
+                    label = "OPEN" if y_pred[i] == 1 else "CLOSED"
+                    preds.append(f"{label}  (wrong)" if wrong else label)
+                if only_disputed.get() and not any_wrong:
+                    continue
+                detail.insert("", tk.END, tags=("disputed",) if any_wrong else (),
+                              values=[fname, "OPEN" if true_val == 1 else "CLOSED"] + preds)
 
-        for i, (fname, true_val) in enumerate(zip(file_names, y_true)):
-            true_str = "OPEN" if true_val == 1 else "CLOSED"
-            preds = []
-            for _, _, _, y_pred, _ in results:
-                p_str = "OPEN" if y_pred[i] == 1 else "CLOSED"
-                marker = "✓" if y_pred[i] == true_val else "✗"
-                preds.append(f"{marker} {p_str}")
-            tree.insert("", tk.END, values=[fname, true_str] + preds)
-
-        tree.grid(row=0, column=0, sticky="nsew")
-        vertical_scrollbar.grid(row=0, column=1, sticky="ns")
-        horizontal_scrollbar.grid(row=1, column=0, sticky="ew")
-        detail_frame.rowconfigure(0, weight=1)
-        detail_frame.columnconfigure(0, weight=1)
+        fill()
+        self._center_over_root(win, self._px(760), self._px(560))
 
     def _save_frame_for_review(self, img_path, reason, config=None):
         """Copy *img_path* into the unclassified folder so it can be labelled later.
@@ -3179,10 +3556,10 @@ class RoofClassifierApp:
         unclassified_folder = self._get_training_class_folder("unclassified")
         if not os.path.isdir(unclassified_folder):
             messagebox.showinfo(
-                "No Images",
-                "No unclassified images folder found.\n\n"
-                "Enable 'Save random samples' mode and start monitoring to collect images,\n"
-                "or add a training data folder that contains an 'unclassified' sub-folder."
+                "Nothing to Review",
+                "There is no unclassified/ folder yet.\n\n"
+                "Turn on one of the options under Collect Frames While Monitoring, or put "
+                "images in an unclassified/ subfolder of the training data folder."
             )
             return
 
@@ -3190,47 +3567,72 @@ class RoofClassifierApp:
             [f for f in os.listdir(unclassified_folder) if f.lower().endswith((".png", ".jpg", ".jpeg"))]
         )
         if not images:
-            messagebox.showinfo("No Images", "No unclassified images to classify.")
+            messagebox.showinfo("Nothing to Review", "All unclassified images have been reviewed.")
             return
 
         self._show_classify_window(unclassified_folder, images)
 
     def _show_classify_window(self, unclassified_folder, images):
-        """Show a Toplevel window for classifying images one-by-one."""
-        win = tk.Toplevel(self.root)
-        win.title("Classify Unclassified Images")
-        win.geometry("860x620")
-        win.resizable(True, True)
+        """Show a Toplevel window for labelling unclassified images one by one.
+
+        Each choice moves the image into the matching training subfolder. The
+        keyboard does everything: O/C/T/D choose, Enter takes the model's
+        suggestion, U or Ctrl+Z undoes, Escape closes.
+        """
+        win = self._make_dialog("Review Unclassified Images", min_size=(560, 440))
 
         state = {
             "index": 0,
             "images": list(images),
             # history entries: (dest_path, src_path) so we can undo by moving back
             "history": [],
-            "tk_img": None,   # keep PhotoImage alive
-            "tmp_path": None, # last temp file to clean up
-            "open_btn": None,   # set after button creation; used by load_current for highlights
-            "closed_btn": None, # set after button creation; used by load_current for highlights
+            "tk_img": None,     # keep PhotoImage alive
+            "tmp_path": None,   # last temp file to clean up
+            "suggested": None,  # label the model predicts for the current image
         }
+        total = len(state["images"])
 
-        # ── Image display ─────────────────────────────────────────────────────
-        img_canvas_frame = tk.Frame(win, bg="black")
-        img_canvas_frame.pack(fill="both", expand=True, padx=10, pady=(10, 0))
+        # ── Image ─────────────────────────────────────────────────────────────
+        viewer = tk.Frame(win, bg=COLOR_VIEWER_BG)
+        viewer.pack(fill="both", expand=True)
+        img_label = tk.Label(viewer, bg=COLOR_VIEWER_BG, fg=COLOR_VIEWER_TEXT, font=self.font_bold)
+        img_label.pack(expand=True, fill="both", padx=self._px(8), pady=self._px(8))
 
-        img_label = tk.Label(img_canvas_frame, bg="black")
-        img_label.pack(expand=True, fill="both")
+        # ── Progress and model suggestion ─────────────────────────────────────
+        info = ttk.Frame(win, padding=(self._px(14), self._px(10), self._px(14), 0))
+        info.pack(fill="x")
+        progress_label = ttk.Label(info, style="Heading.TLabel")
+        progress_label.pack(side=tk.LEFT)
+        name_label = ttk.Label(info, style="Muted.TLabel")
+        name_label.pack(side=tk.LEFT, padx=(self._px(10), 0))
+        pred_label = tk.Label(info, text="", fg=COLOR_MUTED)
+        pred_label.pack(side=tk.RIGHT)
 
-        # ── Info bar ──────────────────────────────────────────────────────────
-        info_label = tk.Label(win, text="", font=("Arial", 10))
-        info_label.pack(pady=(4, 0))
+        # ── Buttons ───────────────────────────────────────────────────────────
+        bar = ttk.Frame(win, padding=(self._px(14), self._px(10), self._px(14), self._px(4)))
+        bar.pack(fill="x")
+        choice_buttons = {}
+        for label, text, underline in (("open", "Open", 0), ("closed", "Closed", 0),
+                                       ("other", "Other", 1), ("discard", "Discard", 0)):
+            button = ttk.Button(bar, text=text, underline=underline,
+                                command=lambda l=label: classify(l))
+            button.pack(side=tk.LEFT, padx=(0, self._px(6)))
+            choice_buttons[label] = button
 
-        # ── Model prediction indicator ────────────────────────────────────────
-        pred_label = tk.Label(win, text="", font=("Arial", 10, "italic"), fg="gray")
-        pred_label.pack(pady=(0, 2))
+        def _on_classify_close():
+            _cleanup_tmp()
+            win.destroy()
 
-        # ── Button bar ────────────────────────────────────────────────────────
-        btn_frame = tk.Frame(win)
-        btn_frame.pack(pady=8)
+        ttk.Button(bar, text="Close", command=_on_classify_close).pack(side=tk.RIGHT)
+        undo_btn = ttk.Button(bar, text="Undo", underline=0, command=lambda: undo())
+        undo_btn.pack(side=tk.RIGHT, padx=(0, self._px(6)))
+
+        ttk.Label(win, style="Muted.TLabel",
+                  text="Keys: O open, C closed, T other, D discard. Enter accepts the model's "
+                       "suggestion. U undoes. Other and discard move the image to other/ and "
+                       "discard/, outside the training set.",
+                  wraplength=self._px(640), justify=tk.LEFT).pack(
+            fill="x", padx=self._px(14), pady=(0, self._px(12)))
 
         def _cleanup_tmp():
             p = state.get("tmp_path")
@@ -3241,40 +3643,48 @@ class RoofClassifierApp:
                     pass
             state["tmp_path"] = None
 
+        def show_suggestion(label, confidence=None):
+            state["suggested"] = label
+            for name, button in choice_buttons.items():
+                button.configure(default="active" if name == label else "normal")
+            if label is None:
+                return
+            text = f"Model suggests {label.upper()}"
+            if confidence is not None:
+                text += f" ({confidence:.0%} sure)"
+            pred_label.config(text=text, fg=ROOF_STATUS_COLORS.get(label.upper(), COLOR_MUTED))
+
         def load_current():
             _cleanup_tmp()
-            remaining = len(state["images"]) - state["index"]
-            if state["index"] >= len(state["images"]):
-                img_label.config(image="", text="✓ All images classified!", fg="white", bg="black",
-                                 font=("Arial", 16, "bold"))
+            done = state["index"] >= total
+            self._set_enabled(undo_btn, bool(state["history"]))
+            for button in choice_buttons.values():
+                self._set_enabled(button, not done)
+            show_suggestion(None)
+            if done:
+                img_label.config(image="", text="All images reviewed.")
                 state["tk_img"] = None
-                info_label.config(text="No more images to classify.")
+                progress_label.config(text=f"{total} of {total}")
+                name_label.config(text="")
                 pred_label.config(text="")
-                if state["open_btn"]:
-                    state["open_btn"].config(relief=tk.RAISED, bd=2)
-                    state["closed_btn"].config(relief=tk.RAISED, bd=2)
                 return
 
             img_name = state["images"][state["index"]]
             img_path = os.path.join(unclassified_folder, img_name)
-            total = len(state["images"])
-            info_label.config(text=f"Image {state['index'] + 1} of {total}  —  {img_name}  ({remaining} remaining)")
+            progress_label.config(text=f"{state['index'] + 1} of {total}")
+            name_label.config(text=self._short_source(img_name, 60))
 
             img_cv = cv2.imread(img_path)
             if img_cv is None:
-                img_label.config(image="", text=f"⚠ Could not load:\n{img_name}",
-                                 fg="red", bg="black", font=("Arial", 11))
+                img_label.config(image="", text=f"Could not read {img_name}")
                 state["tk_img"] = None
                 pred_label.config(text="")
-                if state["open_btn"]:
-                    state["open_btn"].config(relief=tk.RAISED, bd=2)
-                    state["closed_btn"].config(relief=tk.RAISED, bd=2)
                 return
 
-            max_w, max_h = _CLASSIFY_IMG_MAX_W, _CLASSIFY_IMG_MAX_H
+            max_w, max_h = self._px(_CLASSIFY_IMG_MAX_W), self._px(_CLASSIFY_IMG_MAX_H)
             h, w = img_cv.shape[:2]
             scale = min(max_w / w, max_h / h, 1.0)
-            disp = cv2.resize(img_cv, (int(w * scale), int(h * scale)))
+            disp = cv2.resize(img_cv, (max(1, int(w * scale)), max(1, int(h * scale))))
 
             tmp_fd, tmp_path = tempfile.mkstemp(suffix=".png")
             os.close(tmp_fd)
@@ -3284,35 +3694,27 @@ class RoofClassifierApp:
             try:
                 tk_img = tk.PhotoImage(file=tmp_path)
                 state["tk_img"] = tk_img
-                img_label.config(image=tk_img, text="", bg="black")
+                img_label.config(image=tk_img, text="")
             except Exception:
-                img_label.config(image="", text=f"⚠ Display error:\n{img_name}",
-                                 fg="red", bg="black", font=("Arial", 11))
+                img_label.config(image="", text=f"Could not display {img_name}")
                 state["tk_img"] = None
 
-            # ── Model prediction ─────────────────────────────────────────────
-            if state["open_btn"]:
-                state["open_btn"].config(relief=tk.RAISED, bd=2)
-                state["closed_btn"].config(relief=tk.RAISED, bd=2)
-            if self.model is not None:
-                try:
-                    arr = self.prep_image(img_path).flatten().reshape(1, -1)
-                    prediction = self.model.predict(arr)[0]
-                    if prediction == 1:
-                        pred_label.config(text="🤖 Model predicts: OPEN", fg="#228B22")
-                        if state["open_btn"]:
-                            state["open_btn"].config(relief=tk.SOLID, bd=3)
-                    else:
-                        pred_label.config(text="🤖 Model predicts: CLOSED", fg="#CC0000")
-                        if state["closed_btn"]:
-                            state["closed_btn"].config(relief=tk.SOLID, bd=3)
-                except Exception:
-                    pred_label.config(text="🤖 Model prediction unavailable", fg="gray")
-            else:
-                pred_label.config(text="(no model loaded — load one to see predictions)", fg="gray")
+            # ── Model suggestion ─────────────────────────────────────────────
+            if self.model is None:
+                pred_label.config(text="Load a model to see its suggestion", fg=COLOR_MUTED)
+                return
+            try:
+                arr = self.prep_image(img_path).flatten().reshape(1, -1)
+                prediction = self.model.predict(arr)[0]
+                confidence = None
+                if callable(getattr(self.model, "predict_proba", None)):
+                    confidence = float(max(self.model.predict_proba(arr)[0]))
+                show_suggestion("open" if prediction == 1 else "closed", confidence)
+            except Exception:
+                pred_label.config(text="Model suggestion unavailable", fg=COLOR_MUTED)
 
         def classify(label):
-            if state["index"] >= len(state["images"]):
+            if state["index"] >= total:
                 return
             img_name = state["images"][state["index"]]
             src_path = os.path.join(unclassified_folder, img_name)
@@ -3330,7 +3732,7 @@ class RoofClassifierApp:
             try:
                 shutil.move(src_path, dest_path)
             except Exception as e:
-                messagebox.showerror("Error", f"Could not move image: {e}")
+                messagebox.showerror("Could Not Move Image", str(e), parent=win)
                 return
 
             state["history"].append((dest_path, src_path))
@@ -3340,52 +3742,42 @@ class RoofClassifierApp:
 
         def undo():
             if not state["history"]:
-                messagebox.showinfo("Undo", "Nothing to undo.")
                 return
             dest_path, src_path = state["history"].pop()
             try:
                 shutil.move(dest_path, src_path)
             except Exception as e:
-                messagebox.showerror("Error", f"Could not undo: {e}")
+                messagebox.showerror("Could Not Undo", str(e), parent=win)
                 return
             state["index"] = max(0, state["index"] - 1)
             self.update_training_stats()
             load_current()
 
-        open_btn = tk.Button(btn_frame, text="✓  Open", bg="#90EE90", font=("Arial", 11, "bold"),
-                             command=lambda: classify("open"), width=10)
-        open_btn.pack(side=tk.LEFT, padx=6)
-        closed_btn = tk.Button(btn_frame, text="✗  Closed", bg="#FFB6C1", font=("Arial", 11, "bold"),
-                               command=lambda: classify("closed"), width=10)
-        closed_btn.pack(side=tk.LEFT, padx=6)
-        # Store references so load_current can update button highlights
-        state["open_btn"] = open_btn
-        state["closed_btn"] = closed_btn
+        def on_key(action):
+            def handler(_event):
+                action()
+                return "break"
+            return handler
 
-        tk.Button(btn_frame, text="?  Other", bg="#FFE08A", font=("Arial", 11, "bold"),
-                  command=lambda: classify("other"), width=10).pack(side=tk.LEFT, padx=6)
-        tk.Button(btn_frame, text="🗑  Discard", bg="#D3D3D3", font=("Arial", 11),
-                  command=lambda: classify("discard"), width=10).pack(side=tk.LEFT, padx=6)
-        tk.Button(btn_frame, text="↩  Undo", font=("Arial", 11),
-                  command=undo, width=8).pack(side=tk.LEFT, padx=6)
-
-        def _on_classify_close():
-            _cleanup_tmp()
-            win.destroy()
-
-        tk.Button(btn_frame, text="Close", command=_on_classify_close,
-                  width=8).pack(side=tk.LEFT, padx=6)
-
+        for key, label in (("o", "open"), ("c", "closed"), ("t", "other"), ("d", "discard")):
+            for sequence in (f"<KeyPress-{key}>", f"<KeyPress-{key.upper()}>"):
+                win.bind(sequence, on_key(lambda l=label: classify(l)))
+        win.bind("<Return>", on_key(lambda: state["suggested"] and classify(state["suggested"])))
+        for sequence in ("<KeyPress-u>", "<KeyPress-U>", "<Control-z>"):
+            win.bind(sequence, on_key(undo))
+        win.bind("<Escape>", lambda e: _on_classify_close())
         win.protocol("WM_DELETE_WINDOW", _on_classify_close)
 
         load_current()
+        self._center_over_root(win, self._px(_CLASSIFY_IMG_MAX_W + 40),
+                               self._px(_CLASSIFY_IMG_MAX_H + 160))
+        win.focus_set()
 
     def convert_fits_to_png(self):
         """Convert FITS images to PNG with debayering and stretching"""
         if not FITS_AVAILABLE:
-            messagebox.showerror("Error", 
-                "FITS support not available. Please install astropy:\n"
-                "pip install astropy")
+            messagebox.showerror("FITS Support Missing",
+                "Converting FITS files requires astropy:\n\npip install astropy")
             return
             
         # Select FITS files
@@ -3407,106 +3799,119 @@ class RoofClassifierApp:
 
     def show_fits_conversion_dialog(self, fits_files, output_dir):
         """Show dialog for FITS conversion options"""
-        dialog = tk.Toplevel(self.root)
-        dialog.title("FITS to PNG Conversion Options")
-        dialog.geometry("400x300")
-        dialog.transient(self.root)
+        dialog = self._make_dialog("Convert FITS to PNG")
+        dialog.resizable(False, False)
         dialog.grab_set()
-        
+        body = ttk.Frame(dialog, padding=self._px(14))
+        body.pack(fill="both", expand=True)
+
+        count = len(fits_files)
+        ttk.Label(body, text=f"{count} file{'s' if count != 1 else ''} to {output_dir}",
+                  style="Muted.TLabel", wraplength=self._px(380)).pack(anchor="w", pady=(0, self._px(10)))
+
         # Debayer options
-        debayer_frame = tk.LabelFrame(dialog, text="Debayer Options", padx=5, pady=5)
-        debayer_frame.pack(fill="x", padx=10, pady=5)
-        
+        debayer_frame = self._section(body, "Debayer")
+        debayer_frame.pack(fill="x")
         debayer_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(debayer_frame, text="Apply debayering", variable=debayer_var).pack(anchor="w")
-        
+        ttk.Checkbutton(debayer_frame, text="Debayer colour sensor data",
+                        variable=debayer_var).pack(anchor="w", pady=(0, self._px(6)))
         debayer_pattern_var = tk.StringVar(value="RGGB")
-        tk.Label(debayer_frame, text="Bayer pattern:").pack(anchor="w")
-        pattern_frame = tk.Frame(debayer_frame)
+        pattern_frame = ttk.Frame(debayer_frame)
         pattern_frame.pack(fill="x")
+        pattern_widgets = [ttk.Label(pattern_frame, text="Bayer pattern")]
+        pattern_widgets[0].pack(side=tk.LEFT, padx=(0, self._px(8)))
         for pattern in ["RGGB", "BGGR", "GRBG", "GBRG"]:
-            tk.Radiobutton(pattern_frame, text=pattern, variable=debayer_pattern_var, 
-                          value=pattern).pack(side=tk.LEFT)
-        
+            radio = ttk.Radiobutton(pattern_frame, text=pattern, variable=debayer_pattern_var,
+                                    value=pattern)
+            radio.pack(side=tk.LEFT, padx=(0, self._px(8)))
+            pattern_widgets.append(radio)
+        self._enable_with(debayer_var, *pattern_widgets)
+
         # Stretch options
-        stretch_frame = tk.LabelFrame(dialog, text="Stretch Options", padx=5, pady=5)
-        stretch_frame.pack(fill="x", padx=10, pady=5)
-        
+        stretch_frame = self._section(body, "Stretch")
+        stretch_frame.pack(fill="x", pady=(self._px(12), 0))
         stretch_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(stretch_frame, text="Apply histogram stretch", variable=stretch_var).pack(anchor="w")
-        
-        tk.Label(stretch_frame, text="Stretch method:").pack(anchor="w")
+        ttk.Checkbutton(stretch_frame, text="Stretch the histogram",
+                        variable=stretch_var).pack(anchor="w", pady=(0, self._px(6)))
+
         stretch_method_var = tk.StringVar(value="percentile")
-        method_frame = tk.Frame(stretch_frame)
-        method_frame.pack(fill="x")
-        tk.Radiobutton(method_frame, text="Percentile", variable=stretch_method_var, 
-                      value="percentile").pack(side=tk.LEFT)
-        tk.Radiobutton(method_frame, text="Min-Max", variable=stretch_method_var, 
-                      value="minmax").pack(side=tk.LEFT)
-        
-        # Percentile options
-        percentile_frame = tk.Frame(stretch_frame)
-        percentile_frame.pack(fill="x", pady=2)
-        tk.Label(percentile_frame, text="Lower percentile:").pack(side=tk.LEFT)
+        method_frame = ttk.Frame(stretch_frame)
+        method_frame.pack(fill="x", pady=(0, self._px(6)))
+        method_widgets = [ttk.Label(method_frame, text="Method")]
+        method_widgets[0].pack(side=tk.LEFT, padx=(0, self._px(8)))
+        for text, value in (("Percentile", "percentile"), ("Min–max", "minmax")):
+            radio = ttk.Radiobutton(method_frame, text=text, variable=stretch_method_var, value=value)
+            radio.pack(side=tk.LEFT, padx=(0, self._px(8)))
+            method_widgets.append(radio)
+
         lower_perc_var = tk.StringVar(value="0.1")
-        tk.Entry(percentile_frame, textvariable=lower_perc_var, width=5).pack(side=tk.LEFT, padx=5)
-        tk.Label(percentile_frame, text="Upper percentile:").pack(side=tk.LEFT)
         upper_perc_var = tk.StringVar(value="99.9")
-        tk.Entry(percentile_frame, textvariable=upper_perc_var, width=5).pack(side=tk.LEFT, padx=5)
-        
+        percentile_frame = ttk.Frame(stretch_frame)
+        percentile_frame.pack(fill="x", pady=(0, self._px(6)))
+        percentile_widgets = []
+        for text, var in (("Low %", lower_perc_var), ("High %", upper_perc_var)):
+            label = ttk.Label(percentile_frame, text=text)
+            label.pack(side=tk.LEFT)
+            entry = ttk.Entry(percentile_frame, textvariable=var, width=7)
+            entry.pack(side=tk.LEFT, padx=(self._px(6), self._px(14)))
+            percentile_widgets += [label, entry]
+
+        def sync_stretch(*_):
+            stretching = stretch_var.get()
+            for widget in method_widgets:
+                self._set_enabled(widget, stretching)
+            for widget in percentile_widgets:
+                self._set_enabled(widget, stretching and stretch_method_var.get() == "percentile")
+
+        stretch_var.trace_add("write", sync_stretch)
+        stretch_method_var.trace_add("write", sync_stretch)
+        sync_stretch()
+
         # Gamma correction for brightness
-        gamma_frame = tk.Frame(stretch_frame)
-        gamma_frame.pack(fill="x", pady=2)
-        tk.Label(gamma_frame, text="Gamma correction (0.1=bright, 1.0=normal, 3.0=dark):").pack(anchor="w")
-        gamma_entry_frame = tk.Frame(gamma_frame)
-        gamma_entry_frame.pack(fill="x")
-        tk.Label(gamma_entry_frame, text="Gamma:").pack(side=tk.LEFT)
         gamma_var = tk.StringVar(value="0.5")
-        tk.Entry(gamma_entry_frame, textvariable=gamma_var, width=5).pack(side=tk.LEFT, padx=5)
-        
-        # Quick preset buttons
-        preset_frame = tk.Frame(stretch_frame)
-        preset_frame.pack(fill="x", pady=2)
-        tk.Label(preset_frame, text="Quick presets:").pack(anchor="w")
-        preset_buttons_frame = tk.Frame(preset_frame)
-        preset_buttons_frame.pack(fill="x")
-        
-        def apply_conservative():
-            lower_perc_var.set("1")
-            upper_perc_var.set("99")
-            gamma_var.set("1.0")
-        
-        def apply_aggressive():
-            lower_perc_var.set("0.1")
-            upper_perc_var.set("99.9")
-            gamma_var.set("0.5")
-        
-        def apply_very_aggressive():
-            lower_perc_var.set("0.01")
-            upper_perc_var.set("99.99")
-            gamma_var.set("0.3")
-        
-        tk.Button(preset_buttons_frame, text="Conservative", command=apply_conservative).pack(side=tk.LEFT, padx=2)
-        tk.Button(preset_buttons_frame, text="Aggressive", command=apply_aggressive).pack(side=tk.LEFT, padx=2)
-        tk.Button(preset_buttons_frame, text="Very Aggressive", command=apply_very_aggressive).pack(side=tk.LEFT, padx=2)
-        
+        gamma_frame = ttk.Frame(stretch_frame)
+        gamma_frame.pack(fill="x", pady=(0, self._px(6)))
+        ttk.Label(gamma_frame, text="Gamma").pack(side=tk.LEFT)
+        ttk.Entry(gamma_frame, textvariable=gamma_var, width=7).pack(
+            side=tk.LEFT, padx=(self._px(6), self._px(8)))
+        ttk.Label(gamma_frame, text="Below 1 brightens, above 1 darkens",
+                  style="Muted.TLabel").pack(side=tk.LEFT)
+
+        # Quick presets: (low %, high %, gamma)
+        presets = {"Gentle": ("1", "99", "1.0"), "Strong": ("0.1", "99.9", "0.5"),
+                   "Very strong": ("0.01", "99.99", "0.3")}
+        preset_frame = ttk.Frame(stretch_frame)
+        preset_frame.pack(fill="x")
+        ttk.Label(preset_frame, text="Presets").pack(side=tk.LEFT, padx=(0, self._px(8)))
+
+        def apply_preset(values):
+            lower, upper, gamma = values
+            lower_perc_var.set(lower)
+            upper_perc_var.set(upper)
+            gamma_var.set(gamma)
+
+        for name, values in presets.items():
+            ttk.Button(preset_frame, text=name,
+                       command=lambda v=values: apply_preset(v)).pack(side=tk.LEFT, padx=(0, self._px(4)))
+
         # Buttons
-        button_frame = tk.Frame(dialog)
-        button_frame.pack(pady=10)
-        
+        button_frame = ttk.Frame(body)
+        button_frame.pack(fill="x", pady=(self._px(14), 0))
+
         def start_conversion():
             try:
                 lower_perc = float(lower_perc_var.get())
                 upper_perc = float(upper_perc_var.get())
                 gamma = float(gamma_var.get())
                 if not (0 <= lower_perc < upper_perc <= 100):
-                    raise ValueError("Invalid percentile range")
+                    raise ValueError("the low percentile must be below the high one, both between 0 and 100")
                 if not (0.1 <= gamma <= 5.0):
-                    raise ValueError("Gamma must be between 0.1 and 5.0")
+                    raise ValueError("gamma must be between 0.1 and 5.0")
             except ValueError as e:
-                messagebox.showerror("Error", f"Invalid values: {e}")
+                messagebox.showerror("Invalid Settings", f"Check the stretch settings: {e}",
+                                     parent=dialog)
                 return
-                
+
             dialog.destroy()
             self.process_fits_conversion(
                 fits_files, output_dir,
@@ -3514,9 +3919,13 @@ class RoofClassifierApp:
                 stretch_var.get(), stretch_method_var.get(),
                 lower_perc, upper_perc, gamma
             )
-        
-        tk.Button(button_frame, text="Convert", command=start_conversion).pack(side=tk.LEFT, padx=5)
-        tk.Button(button_frame, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
+
+        ttk.Button(button_frame, text="Cancel", command=dialog.destroy).pack(side=tk.RIGHT)
+        convert_btn = ttk.Button(button_frame, text="Convert", default="active",
+                                 command=start_conversion)
+        convert_btn.pack(side=tk.RIGHT, padx=(0, self._px(6)))
+        dialog.bind("<Return>", lambda e: start_conversion())
+        self._center_over_root(dialog)
 
     def process_fits_conversion(self, fits_files, output_dir, apply_debayer, debayer_pattern,
                                apply_stretch, stretch_method, lower_perc, upper_perc, gamma=1.0):
@@ -3621,24 +4030,31 @@ class RoofClassifierApp:
                         
                         converted += 1
                         print(f"Converted {i+1}/{total_files}: {os.path.basename(fits_file)} -> {base_name}.png")
+                        self._defer_to_ui(lambda n=i + 1: self._set_activity(
+                            f"Converting FITS files: {n} of {total_files}…", clear_after_ms=0))
                         
                     except Exception as e:
                         errors.append(f"{os.path.basename(fits_file)}: {str(e)}")
                         print(f"Error processing {fits_file}: {e}")
                         continue
                 
-                # Show results
-                message = f"Conversion complete!\n{converted}/{total_files} files converted successfully."
+                # Show results. Tk is not thread-safe, so dialogs go via the UI thread.
+                message = f"Converted {converted} of {total_files} files to PNG in:\n{output_dir}"
                 if errors:
-                    message += f"\n\nErrors ({len(errors)}):\n" + "\n".join(errors[:5])
+                    message += f"\n\n{len(errors)} failed:\n" + "\n".join(errors[:5])
                     if len(errors) > 5:
-                        message += f"\n... and {len(errors)-5} more errors"
-                
-                messagebox.showinfo("Conversion Complete", message)
-                
+                        message += f"\n…and {len(errors) - 5} more"
+                self._defer_to_ui(lambda: self._set_activity(
+                    f"Converted {converted} of {total_files} FITS files."))
+                if errors:
+                    # A clean run is reported in the status bar alone
+                    self._defer_to_ui(lambda: messagebox.showwarning("Conversion Complete", message))
+
             except Exception as e:
-                messagebox.showerror("Conversion Error", f"Conversion failed: {str(e)}")
-        
+                self._defer_to_ui(lambda e=e: messagebox.showerror(
+                    "Conversion Failed", f"Conversion failed: {e}"))
+
+        self._set_activity(f"Converting FITS files: 0 of {len(fits_files)}…", clear_after_ms=0)
         # Start conversion in background thread
         thread = threading.Thread(target=conversion_worker, daemon=True)
         thread.start()
@@ -3956,48 +4372,50 @@ class RoofClassifierApp:
         except Exception as e:
             if hasattr(self, 'logger') and self.logger:
                 self.logger.error(f"Error calculating observation window: {e}")
-            return None, None, None
+            # (None, None, None) used to come back here, which the caller reads as
+            # "always safe" - exactly wrong for, say, a mistyped latitude.
+            raise
 
     def format_observation_window(self):
         """Format the observation window for display (times shown in UTC)"""
         try:
             window_start, window_end, next_window_start = self.calculate_observation_window()
             
+            def hhmm(value):
+                if not value:
+                    return "unknown"
+                return datetime.strptime(str(value), "%Y/%m/%d %H:%M:%S").strftime("%H:%M")
+
             if window_start == "Never":
-                return "Observation Window: Never safe at this location/time"
+                return "The sun does not get below this limit here today."
             elif window_start is None and window_end is None:
-                return "Observation Window: Always safe at this location/time"
+                return "The sun stays below this limit all day."
             elif window_start is None:
                 # Currently in safe window
-                end_str = datetime.strptime(str(window_end), "%Y/%m/%d %H:%M:%S").strftime("%H:%M UTC") if window_end else "Unknown"
-                next_str = datetime.strptime(str(next_window_start), "%Y/%m/%d %H:%M:%S").strftime("%H:%M UTC") if next_window_start else "Unknown"
-                return f"Current Window: Now → {end_str} | Next: {next_str} → ..."
+                return (f"Sun is below the limit now, until {hhmm(window_end)} UTC. "
+                        f"Next window starts {hhmm(next_window_start)} UTC.")
             else:
-                # Waiting for next window
-                start_str = datetime.strptime(str(window_start), "%Y/%m/%d %H:%M:%S").strftime("%H:%M UTC") if window_start else "Unknown"
-                end_str = datetime.strptime(str(window_end), "%Y/%m/%d %H:%M:%S").strftime("%H:%M UTC") if window_end else "Unknown"
-                return f"Next Window: {start_str} → {end_str}"
-                
+                return f"Next window with the sun below the limit: {hhmm(window_start)}–{hhmm(window_end)} UTC"
+
         except Exception as e:
             if hasattr(self, 'logger') and self.logger:
                 self.logger.error(f"Error formatting observation window: {e}")
-            return "Observation Window: Error calculating"
+            return "Can't calculate the observation window. Check the latitude and longitude."
 
     def update_observation_window_display(self):
-        """Update the observation window display"""
+        """Refresh the observation window and sun altitude, then again in a minute."""
         if hasattr(self, 'obs_window_label'):
             self.obs_window_label.config(text=self.format_observation_window())
-        # Schedule next update in 60 seconds if monitoring. Cancel any pending one
-        # first: every Start calls this, and each call used to add another
-        # self-perpetuating 60s chain.
+        self._update_sun_status_display()
+        # Cancel any pending refresh first, so repeated calls (settings edits,
+        # presets) never stack up extra self-perpetuating 60s chains.
         if self._obs_window_after_id is not None:
             try:
                 self.root.after_cancel(self._obs_window_after_id)
             except Exception:
                 pass
             self._obs_window_after_id = None
-        if self.monitoring_active:
-            self._obs_window_after_id = self.root.after(60000, self.update_observation_window_display)
+        self._obs_window_after_id = self.root.after(60000, self.update_observation_window_display)
 
     def apply_twilight_preset(self, preset_name):
         """Apply a twilight preset to the sun angle threshold"""
@@ -4008,7 +4426,30 @@ class RoofClassifierApp:
             if hasattr(self, 'logger') and self.logger:
                 self.logger.info(f"Applied twilight preset: {preset_name} ({TWILIGHT_PRESETS[preset_name]}°)")
 
-if __name__ == "__main__":
+def _enable_dpi_awareness():
+    """Render crisply on scaled Windows displays instead of as a blurry bitmap.
+
+    Must run before the Tk root is created. Tk then scales its fonts to the
+    real DPI, and the app scales its own pixel sizes to match (see _px).
+    """
+    if sys.platform != "win32":
+        return
+    import ctypes
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # system DPI aware
+    except (AttributeError, OSError):
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except (AttributeError, OSError):
+            pass
+
+
+def main():
+    _enable_dpi_awareness()
     root = tk.Tk()
-    app = RoofClassifierApp(root)
+    RoofClassifierApp(root)
     root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

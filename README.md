@@ -21,88 +21,100 @@ The file format looks like this:
 
 ## Usage
 
-The app is organized into five tabs: **Training & Model**, **Monitoring**, **Configuration**, **Notifications**, and **Utilities**.
+The app is organized into five tabs: **Monitoring**, **Training & Model**, **Configuration**, **Notifications**, and **Utilities**. On first launch, before any model exists, it opens on **Training & Model**; after that it reopens on the tab you last used, at the size and position you left it.
+
+The status bar along the bottom is always visible. It shows whether monitoring is running and what it last reported, the ASCOM server state, and the loaded model, and it holds the **Start Monitoring** / **Stop Monitoring** button, so monitoring can be toggled from any tab.
+
+Every setting is saved automatically shortly after you change it, including values typed into text fields. Closing the window while monitoring is running asks for confirmation first, because the roof status file stops updating once the app exits.
 
 ### Training & Model
 
-1. Optionally set a **Training Data Folder** to store all training images in one place. If left blank, images are stored in `open/` and `closed/` subfolders relative to the working directory.
-2. Use **"Add Frame (Open)"** and **"Add Frame (Closed)"** to import sample images. Duplicate images are detected and skipped automatically.
-3. Click **"Train Model"** to fit the classifier. If a model path is already set, the model is saved there automatically.
-4. Use **"Load Model"** to load a previously saved `.joblib` file. The last-used model is reloaded automatically on startup.
-5. Use **"Save Model As..."** to save the current model to a new location.
-6. Use **"Validate Model"** to check accuracy against a folder of labelled images. The folder must contain `open/` and `closed/` subfolders.
-7. Use **"Benchmark Models"** to compare multiple `.joblib` files side by side against the fixed validation set.
-8. Set a **Fixed Validation Set Folder** to use the same test set each time you validate or benchmark without being prompted.
+1. Optionally set a **Training data folder** to store all training images in one place. If left blank, images are stored in `open/` and `closed/` subfolders relative to the working directory. The counts of open, closed and unreviewed images are shown below it.
+2. Use **"Add Open Images…"** and **"Add Closed Images…"** to import sample images. Duplicate images are detected and skipped automatically.
+3. Click **"Train Model"** to fit the classifier. If a model file is loaded, the new model is saved over it.
+4. Use **"Load Model…"** to load a previously saved `.joblib` file. The last-used model is reloaded automatically on startup. The Model section shows which model is loaded and where it lives.
+5. Use **"Save Model As…"** to save the current model to a new location.
+6. Use **"Validate Model"** to check accuracy against a folder of labelled images. The folder must contain `open/` and `closed/` subfolders. The results window shows the accuracy, a confusion matrix, and each image's result, filtered to the mistakes by default. Double-click an image to open it.
+7. Use **"Benchmark Models…"** to compare multiple `.joblib` files side by side against the fixed validation set. Models are ranked by accuracy, with the costly mistake (reporting OPEN while the roof is closed) counted separately.
+8. Set a **Fixed validation set** folder to use the same test set each time you validate or benchmark without being prompted.
 
-To build up the training set over time, enable **"Save random samples while monitoring"** and set a sample rate (for example, `0.1` saves roughly 10% of checked frames to an `unclassified/` subfolder). Click **"Classify Images"** to work through those images and move each one to `open/`, `closed/`, `other/`, or discard it.
+To build up the training set over time, use the options under **Collect Frames While Monitoring**: save a random sample of frames at a given rate (for example, `0.1` saves roughly 10% of checked frames), save the frame whenever the model's status changes, or save the first frame where the model disagrees with the secondary roof status. Collected frames go to an `unclassified/` subfolder. Click **"Review Unclassified…"** to work through them and move each one to `open/`, `closed/`, `other/`, or `discard/`.
 
-When classifying images, if a model is loaded it automatically runs inference on each image. A **"🤖 Model predicts: OPEN"** (green) or **"🤖 Model predicts: CLOSED"** (red) label appears below the image counter, and the corresponding button receives a highlighted border, so the predicted class is immediately visible.
+The review window is built for going through many frames quickly:
+
+- **O**, **C**, **T** and **D** choose Open, Closed, Other and Discard. **U** or **Ctrl+Z** undoes the last choice, and **Esc** closes the window.
+- If a model is loaded, its prediction for each image is shown (for example "Model suggests CLOSED (95% sure)"), the matching button is highlighted, and **Enter** accepts the suggestion.
 
 ### Monitoring
 
-1. Set the **Monitor Folder** (the folder where your camera saves images).
-2. Optionally set a **Camera Image URL** instead of a folder. When set, the app downloads the image from that URL on each cycle rather than reading from disk. Use the **"Test"** button to verify the URL is reachable before starting. If both are set, the URL takes precedence.
-3. Set the **Output Status File** path (`RoofStatusFile.txt` is the default).
-4. Click **"Start Monitoring"** to begin. The status bar at the bottom of the window shows the current state and provides a quick toggle button.
-5. The app checks the newest image every 60 seconds and appends a line to the output file.
+The Monitoring tab is the day-to-day view. The **Roof Status** panel shows the status currently being reported (`OPEN`, `CLOSED`, or a dash before the first result) and why: the model's classification, the sun guard, the stale-image fail-safe, the no-classification fail-safe, or a manual override. Below that are the time of the last check and the countdown to the next, how long ago the camera image last changed, the sun's altitude against your limit, and, when configured, the secondary roof status.
+
+1. Set the image source and the output file on the **Configuration** tab (see below).
+2. Click **"Start Monitoring"** in the status bar. If no model is loaded, or no image source is set, the app says so and takes you to the tab where you can fix it.
+3. The app checks the newest image every 60 seconds and rewrites the output file.
+4. Tick **"Start monitoring when the app opens"** to resume monitoring automatically after a restart. An automatic start is never blocked by a missing folder: a network share that mounts late, for example, is picked up on a later pass, and the fail-safe below keeps the file safe in the meantime.
 
 A frame that cannot be read (for example because the camera is still writing it) fails that one check and is retried on the next cycle; it never stops monitoring. If no check has produced a classification for three minutes, the output file is rewritten as `Roof Status: CLOSED (No valid classification - failsafe)` so that a dead camera feed cannot leave it reporting `OPEN` all night. An active manual override is still honoured, and the normal status returns as soon as a check succeeds.
 
-The Monitoring tab also shows **"Image last changed: X min ago"** — the elapsed time since the image hash last changed. This turns orange when the image has not changed for longer than the stale threshold (configured in the Notifications tab). The status bar additionally shows a `⚠ stale image` warning in orange when the image is stale.
+The Roof Status panel also shows **"Image last changed … ago"**, the elapsed time since the image hash last changed. It turns amber and reads **"Image unchanged for …"** once the image has not changed for longer than the stale threshold (configured in the Notifications tab), and the status bar then adds "image not changing".
 
 By default a stale image is still classified and reported as usual. A hung camera, a URL serving a cached frame, or capture software that stopped writing hands the classifier the same frame on every pass, so that frame's status (possibly `OPEN`) keeps being reported for as long as the feed stays frozen.
 
-To fail safe instead, choose **"While the image is stale, report: CLOSED (fail-safe)"** in the Stale Image section of the Notifications tab. Then, once the image has not changed for the stale threshold, the output file reports `Roof Status: CLOSED (Image unchanged for N min - failsafe)` and ASCOM clients see `CLOSED`, whether or not the stale notification is enabled. A manual override still wins, and the normal status returns with the next new frame. The stale threshold set there controls when the image counts as stale, for both the notification and this fail-safe.
+To fail safe instead, choose **"CLOSED (fail-safe)"** under "While the image is stale, report" in the Stale Image section of the Notifications tab. Then, once the image has not changed for the stale threshold, the output file reports `Roof Status: CLOSED (Image unchanged for N min - failsafe)` and ASCOM clients see `CLOSED`, whether or not the stale notification is enabled. A manual override still wins, and the normal status returns with the next new frame. The stale threshold set there controls when the image counts as stale, for both the notification and this fail-safe.
 
 #### Latest All-Sky Image preview
 
 The Monitoring tab shows a scaled-down preview of the most recent frame, so you can see what the classifier is actually looking at without opening the image folder. It updates on every monitoring cycle, and the caption shows the source file name (or camera URL) and the time it was displayed.
 
 - **"Refresh"** fetches and displays the latest image on demand, whether or not monitoring is running.
-- **"Show preview"** collapses the panel. While hidden, no preview images are generated at all, which is useful on small screens or low-powered machines.
+- **"Show preview"** hides the image. While hidden, no preview images are generated at all, which is useful on low-powered machines.
 
 #### Manual Override
 
 The **Manual Override** panel forces the reported roof status regardless of what the model sees. This is for the cases where you know better than the classifier — for example while the camera is obscured, during maintenance, or when you want to hard-close the observatory to automation.
 
-1. Choose **Auto (use model)**, **Force OPEN**, or **Force CLOSED**.
-2. Choose a **Duration**: `1 hour`, `4 hours`, `Until noon`, `Until midnight`, or `Forever` (until you clear it).
-3. Click **"Apply Override"**. The panel shows the active override and a live countdown; **"Clear Override"** returns to model output immediately.
+1. Choose **Use the model**, **Force OPEN**, or **Force CLOSED**.
+2. Choose how long, under **For**: `1 hour`, `4 hours`, `Until noon`, `Until midnight`, or `Forever` (until you clear it).
+3. Click **"Apply"**. The panel shows the active override and a live countdown, and the Roof Status panel shows the forced status. **"Clear"** returns to model output immediately.
 
 While an override is active:
 
-- The output status file reports the forced status, annotated as `(Manual override: OPEN|CLOSED)`. It is written the moment you click **"Apply Override"**, not on the next monitoring cycle, so the file is correct even when monitoring is stopped.
+- The output status file reports the forced status, annotated as `(Manual override: OPEN|CLOSED)`. It is written the moment you click **"Apply"**, not on the next monitoring cycle, so the file is correct even when monitoring is stopped.
 - ASCOM clients see the forced status straight away, even while monitoring is stopped. Clearing or expiring an override reports unsafe until the latest image has been re-classified, so the forced status never outlives the override.
 - Clearing an override immediately re-classifies the latest image and rewrites the status file, so the forced line never lingers. (If no model is loaded there is nothing to re-classify, and a warning is logged instead.)
 - The override is written to the settings file, so it survives an app restart. An override whose expiry passed while the app was closed is discarded on the next launch, as is one whose stored expiry is unreadable — a corrupt settings file will never silently turn a timed override into a permanent one.
 - Every applied, expired, and cleared override is logged at `WARNING` level.
 
-> **Safety note:** the sun angle guard is still applied to the ASCOM `IsSafe` flag. A forced `OPEN` is written to the status file, but ASCOM clients will not be told it is safe while the sun is above the configured threshold. To defeat the sun guard as well, change the Sun Angle Threshold in the Configuration tab.
+> **Safety note:** the sun angle guard is still applied to the ASCOM `IsSafe` flag. A forced `OPEN` is written to the status file, but ASCOM clients will not be told it is safe while the sun is above the configured threshold. To defeat the sun guard as well, change the sun limit in the Configuration tab.
 
 ### Configuration
 
+**Image Source** — Set the **Image folder** (the folder where your camera saves images); the newest `.png`, `.jpg` or `.jpeg` in it is checked on each cycle. Optionally set a **Camera image URL** instead: the app then downloads the image from that URL on each cycle rather than reading from disk. Use **"Test"** to verify the URL is reachable before starting. If both are set, the URL takes precedence.
+
+**Status Output** — The **Roof status file** path (`RoofStatusFile.txt` by default).
+
 **Logging** — Enable file logging and choose a log file path. The log records each classification decision, sun angle, and secondary source status. The file is rotated at 5 MB with three backups kept (`roof_classifier.log.1` … `.3`). The ASCOM server keeps its own `ascom_alpaca_safety.log` in the working directory, rotated the same way and logged at `INFO`; per-request detail is only logged when `LOG_LEVEL` in `ascom_alpaca_safety.py` is set to `DEBUG`.
 
-**Observatory Location** — Enter your latitude and longitude (decimal degrees). These are used to calculate the sun's current elevation angle.
+**Observatory** — Enter your latitude and longitude (decimal degrees, longitude positive east). These are used to calculate the sun's current elevation angle.
 
-**Sun Angle Threshold** — If the sun is above this angle (in degrees), any `OPEN` classification is overridden to `CLOSED`. This prevents the output file from reporting the roof open during daytime even if the image classifier disagrees. Preset buttons are provided for common twilight definitions:
+**Sun limit** — If the sun is above this angle (in degrees), any `OPEN` classification is overridden to `CLOSED`. This prevents the output file from reporting the roof open during daytime even if the image classifier disagrees. Preset buttons are provided for common twilight definitions:
 
-- Sunset / Sunrise (0.0 degrees)
+- Horizon (0.0 degrees)
 - Civil (-6.0 degrees)
 - Nautical (-12.0 degrees)
 - Astronomical (-18.0 degrees)
 
-The calculated observation window (next sunset and sunrise in UTC) is displayed and updated automatically.
+The next window with the sun below the limit (in UTC) is displayed, and updates as you edit the location or limit. The sun's current altitude is shown on the Monitoring tab, refreshed every minute.
 
-**Secondary Roof Status File or URL** — Enable this option and point it at a second roof status source to cross-reference. It accepts either a local file path (use **"Browse..."**) or an `http://` / `https://` URL — useful when the authoritative roof file lives on another machine that serves it over HTTP. The last non-empty line must contain `OPEN` or `CLOSED` as a word; a negated or ambiguous line is treated as unreadable rather than guessed at. Use **"Test"** to confirm the source can be read and see the status it currently reports.
+**Secondary Roof Status** — Enable this option and point it at a second roof status source to cross-reference. It accepts either a local file path (use **"Browse…"**) or an `http://` / `https://` URL — useful when the authoritative roof file lives on another machine that serves it over HTTP. The last non-empty line must contain `OPEN` or `CLOSED` as a word; a negated or ambiguous line is treated as unreadable rather than guessed at. Use **"Test"** to confirm the source can be read and see the status it currently reports.
 
-The secondary status is shown in the monitoring display and logged alongside each primary classification, but it does not override the primary decision. For URL sources, the last-update time comes from the server's `Last-Modified` header when present, otherwise the time of the fetch, and results are cached for 30 seconds so UI refreshes do not issue a request per redraw.
+The secondary status is shown in the Roof Status panel and logged alongside each primary classification, but it does not override the primary decision. For URL sources, the last-update time comes from the server's `Last-Modified` header when present, otherwise the time of the fetch, and results are cached for 30 seconds so UI refreshes do not issue a request per redraw.
 
-**ASCOM Alpaca Safety Monitor** — The app can serve an ASCOM Alpaca-compatible Safety Monitor API on a configurable port (default 11111). Enable it here and configure the port and device number. N.I.N.A. and other ASCOM clients can auto-discover the device via UDP port 32227 or connect manually. As the ASCOM SafetyMonitor interface requires, `IsSafe` reads `False` whenever no client has connected the device. The server follows the Alpaca conventions clients rely on: parameter names are case-insensitive, `ClientTransactionID` is echoed (0 when missing or invalid), a missing or malformed `Connected` value is rejected with HTTP 400, and errors use ASCOM error numbers (`0x400` not implemented, `0x40C` action not implemented, `0x4FF` unspecified). Use **"Test Discovery"** to verify the network setup, and **"Open Setup Page"** to view the Alpaca setup endpoint in a browser.
+**ASCOM Alpaca Safety Monitor** — The app can serve an ASCOM Alpaca-compatible Safety Monitor API on a configurable port (default 11111). Set the port and device number and click **"Start Server"**; tick **"Start the server when the app opens"** to have it start with the app. The section shows whether the server is running, whether a client is connected, and whether it is currently reporting Safe or Unsafe (and why); the status bar shows the same in short. The port and device number are locked while the server runs. N.I.N.A. and other ASCOM clients can auto-discover the device via UDP port 32227 or connect manually. As the ASCOM SafetyMonitor interface requires, `IsSafe` reads `False` whenever no client has connected the device. The server follows the Alpaca conventions clients rely on: parameter names are case-insensitive, `ClientTransactionID` is echoed (0 when missing or invalid), a missing or malformed `Connected` value is rejected with HTTP 400, and errors use ASCOM error numbers (`0x400` not implemented, `0x40C` action not implemented, `0x4FF` unspecified). Use **"Test Discovery"** to verify the network setup, and **"Open Setup Page"** to view the Alpaca setup endpoint in a browser.
 
 ### Notifications
 
-Four independently configurable outbound webhook sections. Each section has an enable checkbox, a webhook URL field, and a **"Test"** button that sends a test POST request and reports whether the server accepted it (any non-2xx reply or connection error is shown as a failure). All settings persist to `roof_classifier_settings.json`.
+Four independently configurable outbound webhook sections. Each section has an enable checkbox, plus a webhook URL field and a **"Test"** button that become available once it is enabled. Test sends a test POST request and reports whether the server accepted it (any non-2xx reply or connection error is shown as a failure). All settings persist to `roof_classifier_settings.json`.
 
 Webhooks are HTTP POST requests with a JSON body. The `event` field identifies the trigger:
 
@@ -133,7 +145,7 @@ Example payloads:
 
 ### Utilities
 
-**Convert FITS to PNG** — Batch-convert FITS images to PNG with optional debayering (RGGB, BGGR, GRBG, GBRG) and histogram stretching (percentile or min-max). This is useful for preparing training images captured directly from an astronomy camera.
+**Convert FITS Files…** — Batch-convert FITS images to PNG with optional debayering (RGGB, BGGR, GRBG, GBRG) and histogram stretching (percentile or min-max). This is useful for preparing training images captured directly from an astronomy camera.
 
 ## Installation
 
@@ -175,7 +187,7 @@ and the executable is only built if it passes.
 
 ## System Requirements
 
-- Windows 10 or later
+- Windows 10 or later. The app is DPI-aware, so it renders crisply on scaled (high-DPI) displays.
 - Python 3.11+ (only needed for building from source)
 - Minimal CPU usage when idle
 

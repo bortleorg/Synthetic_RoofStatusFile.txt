@@ -277,7 +277,7 @@ def test_failed_pass_shows_its_reason(display):
     display.update_monitoring_status(None, "Could not read image frame.png")
 
     assert "Could not read image frame.png" in display.status_label.text
-    assert display.status_label.fg == "red"
+    assert display.status_label.fg == srs.COLOR_ERROR
 
 
 def test_failed_pass_mentions_an_active_failsafe(display):
