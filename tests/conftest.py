@@ -29,4 +29,7 @@ def app():
         synthetic_roofstatus.RoofClassifierApp
     )
     instance.logger = None
+    instance.ascom_server = None
+    instance.override_active = None
+    instance.override_expiry = None
     return instance

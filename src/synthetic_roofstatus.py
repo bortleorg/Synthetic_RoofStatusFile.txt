@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import logging
+import logging.handlers
 import shutil
 import urllib.request
 import urllib.error
@@ -47,6 +48,10 @@ if FLASK_AVAILABLE:
 IMG_SIZE = 32
 SETTINGS_FILE = "roof_classifier_settings.json"
 
+# Size cap for the classifier log file, and how many rotated copies to keep.
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_BACKUP_COUNT = 3
+
 # Image display size constants
 _CLASSIFY_IMG_MAX_W = 820  # max width in the classify-images window (leaves room for button bar)
 _CLASSIFY_IMG_MAX_H = 460  # max height in the classify-images window
@@ -74,6 +79,18 @@ _COUNTDOWN_TICK_SECONDS = 1.0
 # rewritten as CLOSED rather than left showing the last good (possibly OPEN)
 # line indefinitely. Matches the age after which ASCOM stops trusting a result.
 FAILSAFE_AFTER_SECONDS = CLASSIFICATION_MAX_AGE_SECONDS
+
+# Default stale-image threshold (minutes) when none is configured. An image that
+# has not changed for this long raises the stale notification and is reported
+# CLOSED rather than trusted.
+DEFAULT_STALE_MINUTES = 10.0
+
+# What to report while the image is stale: keep reporting whatever the model
+# makes of the frozen frame (the default), or CLOSED as a fail-safe.
+STALE_ACTION_CLOSED = "closed"
+STALE_ACTION_KEEP = "keep"
+STALE_ACTIONS = (STALE_ACTION_CLOSED, STALE_ACTION_KEEP)
+DEFAULT_STALE_ACTION = STALE_ACTION_KEEP
 
 # How long a secondary roof status fetched over HTTP is reused before re-fetching.
 # Keeps the UI thread from issuing a network request on every status-label refresh.
@@ -173,6 +190,7 @@ class RoofClassifierApp:
         self.notif_stale_enabled = tk.BooleanVar(value=False)
         self.notif_stale_minutes = tk.StringVar(value="10")
         self.notif_stale_url = tk.StringVar(value="")
+        self.stale_image_action = tk.StringVar(value=DEFAULT_STALE_ACTION)
         self.notif_open_enabled = tk.BooleanVar(value=False)
         self.notif_open_url = tk.StringVar(value="")
         self.notif_closed_enabled = tk.BooleanVar(value=False)
@@ -288,6 +306,9 @@ class RoofClassifierApp:
                 self.notif_stale_enabled.set(settings.get('notif_stale_enabled', False))
                 self.notif_stale_minutes.set(settings.get('notif_stale_minutes', '10'))
                 self.notif_stale_url.set(settings.get('notif_stale_url', ''))
+                stale_action = settings.get('stale_image_action', DEFAULT_STALE_ACTION)
+                self.stale_image_action.set(
+                    stale_action if stale_action in STALE_ACTIONS else DEFAULT_STALE_ACTION)
                 self.notif_open_enabled.set(settings.get('notif_open_enabled', False))
                 self.notif_open_url.set(settings.get('notif_open_url', ''))
                 self.notif_closed_enabled.set(settings.get('notif_closed_enabled', False))
@@ -333,6 +354,7 @@ class RoofClassifierApp:
                 'notif_stale_enabled': self.notif_stale_enabled.get(),
                 'notif_stale_minutes': self.notif_stale_minutes.get(),
                 'notif_stale_url': self.notif_stale_url.get(),
+                'stale_image_action': self.stale_image_action.get(),
                 'notif_open_enabled': self.notif_open_enabled.get(),
                 'notif_open_url': self.notif_open_url.get(),
                 'notif_closed_enabled': self.notif_closed_enabled.get(),
@@ -366,9 +388,12 @@ class RoofClassifierApp:
     def setup_logging(self):
         """Setup logging configuration"""
         if hasattr(self, 'logger') and self.logger:
-            # Remove existing handlers
+            # Remove and close the existing handlers. Removing alone leaked the
+            # log file handle on every Start Monitoring, and on Windows an open
+            # handle stops the file from being rotated, moved or deleted.
             for handler in self.logger.handlers[:]:
                 self.logger.removeHandler(handler)
+                handler.close()
         
         self.logger = logging.getLogger('RoofClassifier')
         self.logger.setLevel(logging.INFO)
@@ -391,7 +416,11 @@ class RoofClassifierApp:
             else:
                 try:
                     # File handler
-                    file_handler = logging.FileHandler(log_path)
+                    # Rotated: the app runs unattended for months and logs every
+                    # pass, so an unbounded file eventually fills the disk.
+                    file_handler = logging.handlers.RotatingFileHandler(
+                        log_path, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT,
+                        encoding="utf-8")
                     file_handler.setFormatter(formatter)
                     self.logger.addHandler(file_handler)
                 except Exception as e:
@@ -407,7 +436,7 @@ class RoofClassifierApp:
         path = self.model_path.get()
         if path and os.path.isfile(path):
             try:
-                self.model = load(path)
+                self.model = self._load_model_file(path)
                 if self.logger:
                     self.logger.info(f"Auto-loaded model from {path}")
             except Exception as e:
@@ -653,6 +682,7 @@ class RoofClassifierApp:
             'notif_stale_enabled': self.notif_stale_enabled.get(),
             'notif_stale_minutes': self.notif_stale_minutes.get(),
             'notif_stale_url': self.notif_stale_url.get().strip(),
+            'stale_image_action': self.stale_image_action.get(),
             'notif_open_enabled': self.notif_open_enabled.get(),
             'notif_open_url': self.notif_open_url.get().strip(),
             'notif_closed_enabled': self.notif_closed_enabled.get(),
@@ -1222,7 +1252,7 @@ class RoofClassifierApp:
         notebook.add(tab_notif, text="Notifications")
 
         # Stale image notification section
-        stale_frame = tk.LabelFrame(tab_notif, text="Stale Image Notification", padx=5, pady=5)
+        stale_frame = tk.LabelFrame(tab_notif, text="Stale Image", padx=5, pady=5)
         stale_frame.pack(fill="x", padx=10, pady=5)
 
         tk.Checkbutton(stale_frame, text="Notify when the latest image has not changed for X minutes",
@@ -1232,6 +1262,19 @@ class RoofClassifierApp:
         stale_min_frame.pack(fill="x", pady=2)
         tk.Label(stale_min_frame, text="Stale threshold (minutes):").pack(side=tk.LEFT)
         tk.Entry(stale_min_frame, textvariable=self.notif_stale_minutes, width=6).pack(side=tk.LEFT, padx=(5, 0))
+
+        stale_action_frame = tk.Frame(stale_frame)
+        stale_action_frame.pack(fill="x", pady=2)
+        tk.Label(stale_action_frame,
+                 text="While the image is stale (camera frozen), report:").pack(anchor="w")
+        tk.Radiobutton(stale_action_frame,
+                       text="The model's classification of the last frame",
+                       variable=self.stale_image_action, value=STALE_ACTION_KEEP,
+                       command=self.save_settings).pack(anchor="w", padx=(15, 0))
+        tk.Radiobutton(stale_action_frame,
+                       text="CLOSED (fail-safe) — don't trust a frozen frame",
+                       variable=self.stale_image_action, value=STALE_ACTION_CLOSED,
+                       command=self.save_settings).pack(anchor="w", padx=(15, 0))
 
         stale_url_outer = tk.Frame(stale_frame)
         stale_url_outer.pack(fill="x", pady=2)
@@ -1441,6 +1484,15 @@ class RoofClassifierApp:
         if not X:
             messagebox.showerror("Error", "No training data found.")
             return
+        if len(set(y)) < 2:
+            # LogisticRegression.fit raises on a single class, which used to
+            # escape the button handler with no message at all.
+            missing = "closed" if 1 in y else "open"
+            messagebox.showerror(
+                "Error",
+                f"Training needs both open and closed examples, but there are no "
+                f"{missing} images. Add some with \"Add Frame ({missing.capitalize()})\".")
+            return
         clf = LogisticRegression(max_iter=1000)
         clf.fit(X, y)
 
@@ -1453,34 +1505,49 @@ class RoofClassifierApp:
             if len(skipped) > 5:
                 message += ", ..."
 
+        # Keep the trained model even if saving it fails - it is still usable.
+        self.model = clf
         if self.model_path.get():
-            dump(clf, self.model_path.get())
-            message += f"\nModel saved to {self.model_path.get()}"
-            self.save_settings()
+            try:
+                dump(clf, self.model_path.get())
+                message += f"\nModel saved to {self.model_path.get()}"
+                self.save_settings()
+            except Exception as e:
+                message += f"\nWARNING: could not save the model to {self.model_path.get()}: {e}"
         else:
             message += "\n(Model not saved - specify a path to save)"
         messagebox.showinfo("Model Trained", message)
-        self.model = clf
+
+    @staticmethod
+    def _load_model_file(path):
+        """Load a .joblib model and check it can classify this app's frames.
+
+        Raises ValueError with a readable message otherwise. A model trained at a
+        different image size (or anything that is not a classifier) used to load
+        without complaint and then fail every single monitoring pass all night.
+        """
+        model = load(path)
+        if not callable(getattr(model, "predict", None)):
+            raise ValueError(f"{os.path.basename(path)} is not a classifier model.")
+        expected = IMG_SIZE * IMG_SIZE
+        n_features = getattr(model, "n_features_in_", None)
+        if n_features != expected:
+            raise ValueError(
+                f"{os.path.basename(path)} reports {n_features!r} input features, but this "
+                f"app produces {expected} ({IMG_SIZE}x{IMG_SIZE} pixels). Retrain the model.")
+        return model
 
     def load_model(self):
         path = filedialog.askopenfilename(filetypes=[("Joblib model", "*.joblib")])
         if path:
-            self.model = load(path)
+            try:
+                self.model = self._load_model_file(path)
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to load model: {e}")
+                return
             self.model_path.set(path)
             self.save_settings()
             messagebox.showinfo("Loaded", f"Loaded model from {path}")
-
-    def save_model_as(self):
-        current_path = self.model_path.get()
-        initial_dir = os.path.dirname(current_path) if current_path else os.getcwd()
-        path = filedialog.asksaveasfilename(
-            defaultextension=".joblib", 
-            filetypes=[("Joblib model", "*.joblib")],
-            initialdir=initial_dir
-        )
-        if path:
-            self.model_path.set(path)
-            self.save_settings()
 
     def prep_image(self, path):
         """Load *path* as the small grayscale array the model works on.
@@ -1621,7 +1688,15 @@ class RoofClassifierApp:
         ``status`` is None when no usable recent classification exists, in which
         case the caller must treat conditions as unsafe rather than reusing an old
         answer. ``age_seconds`` is None only when nothing has ever been classified.
+
+        An active manual override is reported as the current status. The cached
+        classification only picks an override up on the next monitoring pass, so
+        a Force CLOSED used to leave IsSafe True for up to a minute and a half -
+        and indefinitely while monitoring was stopped.
         """
+        override = self.get_manual_override()
+        if override:
+            return override, 0.0
         snapshot = self._last_classification
         if not snapshot:
             return None, None
@@ -1712,6 +1787,24 @@ class RoofClassifierApp:
         # capture is baselined on this so that applying or clearing an override never
         # looks like a model transition.
         model_status = final_status
+
+        # A frozen feed (camera hung, URL serving a cached frame, capture software
+        # stopped writing) still classifies cleanly - the same frame, every pass - so
+        # none of the failure paths fire, and an OPEN frame would be reported all
+        # night. When the user opts in, report CLOSED once the image has not
+        # changed for the stale threshold.
+        # Applied after model_status so the toggle baseline stays the model's view,
+        # and before the override, which still wins.
+        stale_minutes = self._image_unchanged_minutes()
+        if (self._stale_failsafe_enabled(config)
+                and stale_minutes is not None
+                and stale_minutes >= self._stale_threshold_minutes(config)):
+            if final_status == "OPEN" and self.logger:
+                self.logger.warning(
+                    f"Image unchanged for {stale_minutes:.0f} min - reporting CLOSED "
+                    f"instead of OPEN until the camera feed recovers")
+            final_status = "CLOSED"
+            override_reason = f" (Image unchanged for {stale_minutes:.0f} min - failsafe)"
 
         # Apply the manual override last — it wins over both the model and the sun guard
         # for the reported roof status. (The ASCOM IsSafe flag keeps its own sun check.)
@@ -1963,16 +2056,10 @@ class RoofClassifierApp:
         # Stale image notification.
         # The notification is sent once when the image first becomes stale, then re-sent
         # after every additional stale_minutes interval while the image remains unchanged.
-        stale_minutes_val = 10.0
-        elapsed_minutes = 0.0
-        is_stale = False
-        if self.last_new_hash_time is not None:
-            try:
-                stale_minutes_val = float(config.get('notif_stale_minutes', 10))
-            except (TypeError, ValueError):
-                stale_minutes_val = 10.0
-            elapsed_minutes = (now - self.last_new_hash_time).total_seconds() / 60.0
-            is_stale = elapsed_minutes >= stale_minutes_val
+        stale_minutes_val = self._stale_threshold_minutes(config)
+        elapsed_minutes = self._image_unchanged_minutes(now)
+        is_stale = elapsed_minutes is not None and elapsed_minutes >= stale_minutes_val
+        elapsed_minutes = elapsed_minutes or 0.0
 
         if config.get('notif_stale_enabled') and is_stale:
             url = config.get('notif_stale_url', '')
@@ -2008,6 +2095,31 @@ class RoofClassifierApp:
                     self._send_webhook(url, {"event": "heartbeat", "status": status, "timestamp": ts})
                     self._last_heartbeat_time = now
 
+    @staticmethod
+    def _stale_threshold_minutes(config):
+        """The configured stale-image threshold in minutes, or the default when unset
+        or invalid. Used by the stale notification, the UI and the stale fail-safe."""
+        try:
+            minutes = float(config.get('notif_stale_minutes', DEFAULT_STALE_MINUTES))
+        except (TypeError, ValueError):
+            return DEFAULT_STALE_MINUTES
+        if not math.isfinite(minutes) or minutes <= 0:
+            return DEFAULT_STALE_MINUTES
+        return minutes
+
+    @staticmethod
+    def _stale_failsafe_enabled(config):
+        """True only when the user opted into reporting CLOSED for a stale frame.
+        Missing or unrecognised values mean the default: keep the model's view."""
+        return config.get('stale_image_action', DEFAULT_STALE_ACTION) == STALE_ACTION_CLOSED
+
+    def _image_unchanged_minutes(self, now=None):
+        """Minutes since the image hash last changed, or None before the first frame."""
+        if self.last_new_hash_time is None:
+            return None
+        now = now or datetime.utcnow()
+        return (now - self.last_new_hash_time).total_seconds() / 60.0
+
     def _update_hash_status_display(self):
         """Refresh the image hash status label. Returns True if the image is considered stale."""
         if not hasattr(self, "hash_status_label"):
@@ -2028,10 +2140,8 @@ class RoofClassifierApp:
         else:
             elapsed_str = f"{elapsed_minutes / 60.0:.1f} hr ago"
 
-        try:
-            stale_minutes = float(self.notif_stale_minutes.get())
-        except ValueError:
-            stale_minutes = 10.0
+        stale_minutes = self._stale_threshold_minutes(
+            {'notif_stale_minutes': self.notif_stale_minutes.get()})
 
         is_stale = elapsed_minutes >= stale_minutes
 
@@ -2118,6 +2228,9 @@ class RoofClassifierApp:
             expired = self.override_active
             self.override_active = None
             self.override_expiry = None
+            # The cached result was produced under the override; it says nothing
+            # about what the model sees now.
+            self._last_classification = None
             if self.logger:
                 self.logger.warning(
                     f"Manual override ({expired}) expired — reverting to model output"
@@ -2158,6 +2271,8 @@ class RoofClassifierApp:
         # would leave the status file — and therefore ASCOM clients — reporting the
         # previous result for up to a minute, or indefinitely if monitoring is stopped.
         written = self._write_status_file(mode, f" (Manual override: {mode})")
+        # Same for the ASCOM flag, which would otherwise wait for its next refresh.
+        self._refresh_ascom_safety()
 
         note = ("The status file has been updated immediately."
                 if written else
@@ -2176,12 +2291,18 @@ class RoofClassifierApp:
         was = self.override_active
         self.override_active = None
         self.override_expiry = None
+        if was:
+            # The cached result carries the forced status. Drop it so ASCOM reports
+            # "no status yet" (unsafe) until the re-classification below lands,
+            # rather than the override that was just cleared.
+            self._last_classification = None
         self.override_mode.set("AUTO")
         self.save_settings()
         if was and self.logger:
             self.logger.warning(f"Manual override ({was}) cleared — reverting to model output")
         self._update_override_display()
         if was:
+            self._refresh_ascom_safety()
             # Re-classify now so the status file stops reporting the cleared override
             self._refresh_status_now()
 
@@ -2202,12 +2323,28 @@ class RoofClassifierApp:
             try:
                 # Force a fresh pass: any cached result predates the override change.
                 filename, status = self.classify_latest_png(config, max_cache_age=0)
+                self._refresh_ascom_safety()
                 self.root.after(0, lambda f=filename, s=status: self.update_monitoring_status(f, s))
             except Exception as e:
                 if self.logger:
                     self.logger.error(f"Error refreshing status after override change: {e}")
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _refresh_ascom_safety(self):
+        """Recompute the ASCOM IsSafe flag now instead of on its next timed refresh.
+
+        Called whenever the reported status changes, so a client polling IsSafe
+        does not act on a flag up to UPDATE_INTERVAL_SECONDS out of date.
+        """
+        server = self.ascom_server
+        if server is None:
+            return
+        try:
+            server.refresh_safety_status()
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"Could not refresh ASCOM safety status: {e}")
 
     def _format_override_remaining(self):
         """Human-readable time left on the current override."""
@@ -2570,6 +2707,9 @@ class RoofClassifierApp:
                         if self.logger:
                             self.logger.error(f"Could not apply fail-safe status: {e}")
 
+                # Publish the new result (or its absence) to ASCOM clients now.
+                self._refresh_ascom_safety()
+
                 self._defer_to_ui(lambda f=filename, s=status: self.update_monitoring_status(f, s))
 
                 # Send notifications if configured (runs in background thread)
@@ -2737,7 +2877,7 @@ class RoofClassifierApp:
         )
         if path:
             try:
-                self.model = load(path)
+                self.model = self._load_model_file(path)
                 self.model_path.set(path)
                 self.save_settings()
             except Exception as e:
@@ -2767,18 +2907,6 @@ class RoofClassifierApp:
     def save_model_as(self):
         """Legacy method - redirects to save_current_model_as for compatibility"""
         self.save_current_model_as()
-
-    def browse_monitor_folder(self):
-        """Browse for monitor folder"""
-        current_path = self.monitor_path.get()
-        initial_dir = current_path if current_path and os.path.isdir(current_path) else os.getcwd()
-        folder = filedialog.askdirectory(
-            title="Select Folder to Monitor",
-            initialdir=initial_dir
-        )
-        if folder:
-            self.monitor_path.set(folder)
-            self.save_settings()
 
     def browse_output_file(self):
         """Browse for output file path"""
@@ -2895,7 +3023,7 @@ class RoofClassifierApp:
         errors = []
         for path in model_files:
             try:
-                mdl = load(path)
+                mdl = self._load_model_file(path)
                 y_pred = mdl.predict(X_arr)
                 acc = accuracy_score(y_val, y_pred)
                 cm = confusion_matrix(y_val, y_pred)
