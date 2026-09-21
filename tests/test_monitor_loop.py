@@ -199,3 +199,13 @@ def test_stop_monitoring_sets_only_the_current_event(looper):
 
     assert current.is_set()
     assert looper.cleared == 1
+
+
+def test_loop_without_a_run_returns_instead_of_crashing(looper):
+    """monitor_loop called before any Start has no stop event to honour."""
+    looper._monitor_stop_event = None
+    looper.classify_latest_png = lambda *a, **k: pytest.fail("loop ran without a run")
+
+    looper.monitor_loop()
+
+    assert looper.cleared == 0

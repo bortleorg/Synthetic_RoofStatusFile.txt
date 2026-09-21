@@ -2526,6 +2526,12 @@ class RoofClassifierApp:
         """
         if stop_event is None:
             stop_event = self._monitor_stop_event
+        if stop_event is None:
+            # Only start_monitoring creates a run; without one there is nothing
+            # that could ever stop this loop.
+            if self.logger:
+                self.logger.error("monitor_loop called without a monitoring run - not starting")
+            return
         try:
             while not stop_event.is_set():
                 config = None

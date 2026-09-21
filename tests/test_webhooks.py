@@ -41,10 +41,17 @@ def server():
     httpd.server_close()
 
 
-def unused_port():
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+@pytest.fixture
+def dead_url():
+    """A URL nothing answers. The port stays bound (but not listening) for the
+    whole test, so no other process can claim it and turn the refusal into a
+    real connection."""
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    try:
+        yield f"http://127.0.0.1:{sock.getsockname()[1]}"
+    finally:
+        sock.close()
 
 
 def test_2xx_is_success(app, server):
@@ -70,8 +77,8 @@ def test_client_error_is_failure(app, server):
     assert app._send_webhook(f"{server}/404", {})[0] is False
 
 
-def test_unreachable_host_is_failure_not_exception(app):
-    ok, detail = app._send_webhook(f"http://127.0.0.1:{unused_port()}/", {})
+def test_unreachable_host_is_failure_not_exception(app, dead_url):
+    ok, detail = app._send_webhook(f"{dead_url}/", {})
 
     assert ok is False
     assert detail
@@ -144,7 +151,7 @@ def test_test_button_reports_an_http_error(app, server, ui):
     assert "500" in ui.shown[0][2]
 
 
-def test_test_button_reports_an_unreachable_host(app, ui):
-    app._test_webhook(Var(f"http://127.0.0.1:{unused_port()}/hook"))
+def test_test_button_reports_an_unreachable_host(app, ui, dead_url):
+    app._test_webhook(Var(f"{dead_url}/hook"))
 
     assert ui.wait() == ["error"]
