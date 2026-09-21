@@ -7,6 +7,8 @@ from joblib import dump, load
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 import threading
+import math
+import time
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -2571,10 +2573,16 @@ class RoofClassifierApp:
                         if self.logger:
                             self.logger.error(f"Error sending notifications: {e}")
 
-                # Countdown with one update per tick; a stop request ends it at once.
-                for remaining in range(MONITOR_INTERVAL_SECONDS, 0, -1):
-                    self._defer_to_ui(lambda r=remaining: self.update_countdown(r))
-                    if stop_event.wait(_COUNTDOWN_TICK_SECONDS):
+                # Count down to a real deadline, one UI update per tick, so the
+                # interval holds whatever the tick length; a stop request ends
+                # the wait at once.
+                deadline = time.monotonic() + MONITOR_INTERVAL_SECONDS
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self._defer_to_ui(lambda r=math.ceil(remaining): self.update_countdown(r))
+                    if stop_event.wait(min(_COUNTDOWN_TICK_SECONDS, remaining)):
                         break
         finally:
             self._defer_to_ui(lambda: self._on_monitor_loop_exit(stop_event))
@@ -2616,7 +2624,10 @@ class RoofClassifierApp:
             else:
                 status, reason = "CLOSED", " (No valid classification - failsafe)"
 
-            written = self._write_status_file(status, reason, output_path)
+            # Stamp the line with the same instant the age check used, in the
+            # local time the status file is written in.
+            timestamp = now.astimezone().strftime("%Y-%m-%d %I:%M:%S%p")
+            written = self._write_status_file(status, reason, output_path, timestamp)
             if written and not self._failsafe_active and self.logger:
                 self.logger.warning(
                     f"No valid classification for over {FAILSAFE_AFTER_SECONDS}s - "

@@ -8,6 +8,7 @@ reset the new run's state.
 """
 
 import threading
+import time
 
 import pytest
 
@@ -28,8 +29,8 @@ class FakeRoot:
 
 @pytest.fixture
 def looper(app, monkeypatch):
-    monkeypatch.setattr(srs, "MONITOR_INTERVAL_SECONDS", 1)
-    monkeypatch.setattr(srs, "_COUNTDOWN_TICK_SECONDS", 0.001)
+    monkeypatch.setattr(srs, "MONITOR_INTERVAL_SECONDS", 0.02)
+    monkeypatch.setattr(srs, "_COUNTDOWN_TICK_SECONDS", 0.005)
 
     app.root = FakeRoot()
     app._monitor_stop_event = threading.Event()
@@ -209,3 +210,45 @@ def test_loop_without_a_run_returns_instead_of_crashing(looper):
     looper.monitor_loop()
 
     assert looper.cleared == 0
+
+
+def test_interval_holds_when_the_tick_is_not_one_second(looper, monkeypatch):
+    """The wait is driven by a deadline, not by counting ticks as seconds."""
+    monkeypatch.setattr(srs, "MONITOR_INTERVAL_SECONDS", 0.3)
+    monkeypatch.setattr(srs, "_COUNTDOWN_TICK_SECONDS", 0.05)
+    started = []
+
+    def classify(config, max_cache_age=None):
+        started.append(time.monotonic())
+        if len(started) == 2:
+            looper._monitor_stop_event.set()
+        return "frame.png", "OPEN"
+
+    looper.classify_latest_png = classify
+
+    run_loop(looper)
+
+    gap = started[1] - started[0]
+    assert 0.3 <= gap < 1.0, f"passes {gap:.3f}s apart, expected ~0.3s"
+
+
+def test_countdown_reports_whole_seconds_down_to_one(looper, monkeypatch):
+    monkeypatch.setattr(srs, "MONITOR_INTERVAL_SECONDS", 2.5)
+    monkeypatch.setattr(srs, "_COUNTDOWN_TICK_SECONDS", 0.5)
+    shown = []
+    looper.update_countdown = shown.append
+    passes = []
+
+    def classify(config, max_cache_age=None):
+        passes.append(1)
+        if len(passes) == 2:
+            looper._monitor_stop_event.set()
+        return "frame.png", "OPEN"
+
+    looper.classify_latest_png = classify
+
+    run_loop(looper, timeout=10)
+
+    assert all(isinstance(r, int) for r in shown)
+    assert shown[0] == 3 and shown[-1] == 1
+    assert shown == sorted(shown, reverse=True)

@@ -86,3 +86,14 @@ def test_failed_write_is_reported(failsafe):
 
     assert failsafe._apply_failsafe_status(failsafe.config) is False
     assert failsafe._failsafe_active is False
+
+
+def test_line_is_stamped_with_the_injected_time(failsafe):
+    """The age check and the written timestamp use the same instant."""
+    failsafe._last_good_pass_at = None
+    now = datetime(2026, 9, 20, 7, 5, 9, tzinfo=timezone.utc)
+
+    failsafe._apply_failsafe_status(failsafe.config, now=now)
+
+    expected = now.astimezone().strftime("%Y-%m-%d %I:%M:%S%p")
+    assert failsafe.output.read_text().startswith(f"???{expected} Roof Status: CLOSED")
