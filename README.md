@@ -46,6 +46,8 @@ When classifying images, if a model is loaded it automatically runs inference on
 4. Click **"Start Monitoring"** to begin. The status bar at the bottom of the window shows the current state and provides a quick toggle button.
 5. The app checks the newest image every 60 seconds and appends a line to the output file.
 
+A frame that cannot be read (for example because the camera is still writing it) fails that one check and is retried on the next cycle; it never stops monitoring. If no check has produced a classification for three minutes, the output file is rewritten as `Roof Status: CLOSED (No valid classification - failsafe)` so that a dead camera feed cannot leave it reporting `OPEN` all night. An active manual override is still honoured, and the normal status returns as soon as a check succeeds.
+
 The Monitoring tab also shows **"Image last changed: X min ago"** — the elapsed time since the image hash last changed. This turns orange when the image has not changed for longer than the stale threshold (configured in the Notifications tab). The status bar additionally shows a `⚠ stale image` warning in orange when the image is stale.
 
 #### Latest All-Sky Image preview
@@ -92,11 +94,11 @@ The calculated observation window (next sunset and sunrise in UTC) is displayed 
 
 The secondary status is shown in the monitoring display and logged alongside each primary classification, but it does not override the primary decision. For URL sources, the last-update time comes from the server's `Last-Modified` header when present, otherwise the time of the fetch, and results are cached for 30 seconds so UI refreshes do not issue a request per redraw.
 
-**ASCOM Alpaca Safety Monitor** — The app can serve an ASCOM Alpaca-compatible Safety Monitor API on a configurable port (default 11111). Enable it here and configure the port and device number. N.I.N.A. and other ASCOM clients can auto-discover the device via UDP port 32227 or connect manually. Use **"Test Discovery"** to verify the network setup, and **"Open Setup Page"** to view the Alpaca setup endpoint in a browser.
+**ASCOM Alpaca Safety Monitor** — The app can serve an ASCOM Alpaca-compatible Safety Monitor API on a configurable port (default 11111). Enable it here and configure the port and device number. N.I.N.A. and other ASCOM clients can auto-discover the device via UDP port 32227 or connect manually. As the ASCOM SafetyMonitor interface requires, `IsSafe` reads `False` whenever no client has connected the device. Use **"Test Discovery"** to verify the network setup, and **"Open Setup Page"** to view the Alpaca setup endpoint in a browser.
 
 ### Notifications
 
-Four independently configurable outbound webhook sections. Each section has an enable checkbox, a webhook URL field, and a **"Test"** button that sends a test POST request. All settings persist to `roof_classifier_settings.json`.
+Four independently configurable outbound webhook sections. Each section has an enable checkbox, a webhook URL field, and a **"Test"** button that sends a test POST request and reports whether the server accepted it (any non-2xx reply or connection error is shown as a failure). All settings persist to `roof_classifier_settings.json`.
 
 Webhooks are HTTP POST requests with a JSON body. The `event` field identifies the trigger:
 
@@ -157,7 +159,9 @@ python -m pytest
 
 The suite covers the parts that run unattended overnight: the roof status file
 writer, settings persistence, the secondary-source parser, the sun-angle safety
-guard, classification caching/locking, and the ASCOM safety and discovery logic.
+guard, classification caching/locking, the monitor loop and its fail-safe,
+unreadable-image handling, webhook delivery, and the ASCOM safety and discovery
+logic.
 It needs no display and no camera. CI runs it on every push and pull request,
 and the executable is only built if it passes.
 
@@ -173,5 +177,5 @@ and the executable is only built if it passes.
 - Images should be reasonably consistent in angle and framing.
 - Works best when lighting or exposure is fairly stable across captures.
 - Settings (model path, folder paths, location, thresholds, etc.) are saved automatically to `roof_classifier_settings.json` in the working directory and restored on the next launch. Both this file and the roof status file are written atomically, so a crash or a reader polling the file cannot leave either one half-written. A settings file that is unreadable anyway is moved aside to `roof_classifier_settings.json.corrupt` and defaults are used.
-- Safety decisions fail closed. If the sun altitude cannot be calculated, or the last roof classification is more than three minutes old, the ASCOM `IsSafe` flag reports unsafe rather than assuming the best.
+- Safety decisions fail closed. If the sun altitude cannot be calculated, or the last roof classification is more than three minutes old, the ASCOM `IsSafe` flag reports unsafe rather than assuming the best. The roof status file follows suit after three minutes without a valid classification.
 - A secondary roof status file is parsed on whole words. A line such as `roof is not open` is treated as unreadable rather than as `OPEN`, and a line mentioning both states is read as `CLOSED`.

@@ -18,6 +18,9 @@ UPDATE_INTERVAL_SECONDS = 30
 # A roof classification older than this is not trusted for the IsSafe flag.
 MAX_STATUS_AGE_SECONDS = 180
 
+# Reported alongside IsSafe=False while no client has connected the device.
+NOT_CONNECTED_MESSAGE = "Device is not connected"
+
 
 def compute_safety(status, sun_safe, age_seconds, max_age_seconds=MAX_STATUS_AGE_SECONDS):
     """Decide the ASCOM IsSafe flag from the latest roof classification.
@@ -329,7 +332,7 @@ class AscomAlpacaSafetyMonitor:
                 <div class="status">
                     <h3>Current Status</h3>
                     <p><strong>Connected:</strong> {self.connected}</p>
-                    <p><strong>Safe:</strong> {self.is_safe}</p>
+                    <p><strong>Safe:</strong> {self.reported_safety()[0]}</p>
                     <p><strong>Last Update:</strong> {self.last_update.isoformat()}</p>
                 </div>
                 
@@ -382,6 +385,10 @@ class AscomAlpacaSafetyMonitor:
                             # flag that is up to one update interval out of date.
                             self.refresh_safety_status()
                         else:
+                            # Refreshes stop while disconnected, so drop the flag
+                            # now instead of freezing its last value.
+                            self.is_safe = False
+                            self.last_error = NOT_CONNECTED_MESSAGE
                             self.logger.info("ASCOM client disconnected")
                     else:
                         self.logger.warning("No Connected parameter found in request")
@@ -394,7 +401,8 @@ class AscomAlpacaSafetyMonitor:
         @self.app.route(f'{device_base}/issafe', methods=['GET'])
         def is_safe():
             """Return current safety status"""
-            return self.get_ascom_response(self.is_safe, 0, self.last_error)
+            safe, error = self.reported_safety()
+            return self.get_ascom_response(safe, 0, error)
             
         @self.app.route(f'{device_base}/name', methods=['GET'])
         def device_name():
@@ -510,12 +518,13 @@ class AscomAlpacaSafetyMonitor:
                 except Exception as e:
                     self.logger.warning(f"Error getting roof status: {e}")
             
+            safe, error = self.reported_safety()
             return self.get_ascom_response({
-                'IsSafe': self.is_safe,
+                'IsSafe': safe,
                 'RoofStatus': roof_status,
                 'SunAngle': sun_angle,
                 'LastUpdate': self.last_update.isoformat(),
-                'LastError': self.last_error
+                'LastError': error
             })
         
         # Catch-all route for debugging unknown requests
@@ -533,6 +542,19 @@ class AscomAlpacaSafetyMonitor:
                 self.logger.warning(f"Unknown endpoint: {request.method} /{path}")
             return self.get_ascom_response(None, 1, f"Unknown endpoint: /{path}")
             
+    def reported_safety(self):
+        """Return ``(is_safe, error_message)`` as clients should see it.
+
+        The ASCOM SafetyMonitor contract is that IsSafe is False while the device
+        is not connected. The stored flag is only refreshed while connected, so
+        without this gate a client polling IsSafe without connecting first (or
+        after another client disconnected) read whatever value was last computed
+        - possibly True from hours earlier.
+        """
+        if not self.connected:
+            return False, NOT_CONNECTED_MESSAGE
+        return self.is_safe, self.last_error
+
     def refresh_safety_status(self):
         """Recompute IsSafe once from the classifier's latest result."""
         try:

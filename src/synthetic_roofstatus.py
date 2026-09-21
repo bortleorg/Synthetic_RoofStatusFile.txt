@@ -7,7 +7,6 @@ from joblib import dump, load
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 import threading
-import time
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -63,6 +62,16 @@ CLASSIFICATION_CACHE_SECONDS = 30
 # A cached classification older than this is treated as unavailable: the ASCOM
 # safety monitor must not keep reporting a stale roof state as authoritative.
 CLASSIFICATION_MAX_AGE_SECONDS = 180
+
+# Seconds between monitoring passes, and the granularity of the countdown (and of
+# noticing a stop request) in between.
+MONITOR_INTERVAL_SECONDS = 60
+_COUNTDOWN_TICK_SECONDS = 1.0
+
+# When no pass has produced a classification for this long, the status file is
+# rewritten as CLOSED rather than left showing the last good (possibly OPEN)
+# line indefinitely. Matches the age after which ASCOM stops trusting a result.
+FAILSAFE_AFTER_SECONDS = CLASSIFICATION_MAX_AGE_SECONDS
 
 # How long a secondary roof status fetched over HTTP is reused before re-fetching.
 # Keeps the UI thread from issuing a network request on every status-label refresh.
@@ -177,8 +186,16 @@ class RoofClassifierApp:
         self.validation_set_path = tk.StringVar(value="")
 
         self.model = None
-        self.stop_monitor = True
+        # Each monitoring run gets its own stop event, so a loop that is still
+        # finishing after Stop can never be revived by the next Start (see
+        # start_monitoring), and its exit cannot reset the new run's UI.
+        self._monitor_stop_event = None
         self.monitoring_active = False
+        self._obs_window_after_id = None
+        # Fail-safe bookkeeping: when the last pass that produced a classification
+        # ran, and whether the status file currently holds a fail-safe line.
+        self._last_good_pass_at = None
+        self._failsafe_active = False
         self.logger = None
         self.ascom_server = None
         self._startup_model_error = None
@@ -1311,9 +1328,7 @@ class RoofClassifierApp:
 
     def get_image_hash(self, image_path):
         """Generate a hash of the image content to detect duplicates"""
-        img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-        img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
-        return hashlib.md5(img.tobytes()).hexdigest()
+        return hashlib.md5(self.prep_image(image_path).tobytes()).hexdigest()
 
     def get_existing_hashes(self, folder_path):
         """Get hashes of all existing images in the given training folder"""
@@ -1324,7 +1339,7 @@ class RoofClassifierApp:
                     try:
                         hash_val = self.get_image_hash(os.path.join(folder_path, file))
                         hashes.add(hash_val)
-                    except:
+                    except Exception:
                         continue
         return hashes
 
@@ -1397,17 +1412,30 @@ class RoofClassifierApp:
         messagebox.showinfo("Cleared", "All training data has been cleared.")
         self.update_training_stats()
 
-    def train_model(self):
-        X, y = [], []
+    def _load_training_data(self):
+        """Load the labelled training images as ``(X, y, skipped)``.
+
+        An unreadable file (truncated, or not really an image) is listed in
+        *skipped* instead of aborting the whole training run.
+        """
+        X, y, skipped = [], [], []
         for label, val in [("open", 1), ("closed", 0)]:
             folder = self._get_training_class_folder(label)
             if not os.path.isdir(folder):
                 continue
             for file in os.listdir(folder):
                 if file.lower().endswith((".png", ".jpg", ".jpeg")):
-                    img = self.prep_image(os.path.join(folder, file))
+                    try:
+                        img = self.prep_image(os.path.join(folder, file))
+                    except ValueError:
+                        skipped.append(f"{label}/{file}")
+                        continue
                     X.append(img.flatten())
                     y.append(val)
+        return X, y, skipped
+
+    def train_model(self):
+        X, y, skipped = self._load_training_data()
         if not X:
             messagebox.showerror("Error", "No training data found.")
             return
@@ -1418,6 +1446,10 @@ class RoofClassifierApp:
         open_count = sum(1 for label in y if label == 1)
         closed_count = sum(1 for label in y if label == 0)
         message = f"Model trained successfully!\nTraining samples: Open: {open_count}, Closed: {closed_count}"
+        if skipped:
+            message += f"\nSkipped {len(skipped)} unreadable image(s): {', '.join(skipped[:5])}"
+            if len(skipped) > 5:
+                message += ", ..."
 
         if self.model_path.get():
             dump(clf, self.model_path.get())
@@ -1449,9 +1481,17 @@ class RoofClassifierApp:
             self.save_settings()
 
     def prep_image(self, path):
+        """Load *path* as the small grayscale array the model works on.
+
+        Raises ValueError when the file cannot be decoded. cv2.imread reports
+        that by returning None, which used to reach cv2.resize as an opaque
+        cv2.error - on the monitor thread that ended monitoring for good whenever
+        the camera was still writing the newest frame.
+        """
         img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-        img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
-        return img
+        if img is None:
+            raise ValueError(f"Could not read image {path}")
+        return cv2.resize(img, (IMG_SIZE, IMG_SIZE))
 
     def validate_model(self):
         """Run validation on a set of test images.
@@ -1610,8 +1650,26 @@ class RoofClassifierApp:
                 self.logger.error(f"Could not obtain an image to classify: {error}")
             return None, error
 
-        tmp_path = img_path if is_temp else None
+        try:
+            # Decode before anything else touches the frame: a half-written file
+            # must fail this pass cleanly, not get sampled into the training set.
+            try:
+                img = self.prep_image(img_path).flatten().reshape(1, -1)
+            except ValueError as e:
+                if self.logger:
+                    self.logger.error(f"Skipping unreadable image {latest}: {e}")
+                return None, f"Could not read image {latest}"
+            return self._classify_image(img, img_path, latest, is_temp, config)
+        finally:
+            # A URL download is ours to delete, whatever happened above.
+            if is_temp:
+                try:
+                    os.unlink(img_path)
+                except OSError:
+                    pass
 
+    def _classify_image(self, img, img_path, latest, is_temp, config):
+        """Classify a decoded frame and write the status file (see above)."""
         if not is_temp:
             # Optionally save a random sample for manual classification
             self.save_sample_if_needed(img_path, config)
@@ -1634,7 +1692,6 @@ class RoofClassifierApp:
         secondary_status, secondary_time = self.read_secondary_source(config)
         
         # Classify the image
-        img = self.prep_image(img_path).flatten().reshape(1, -1)
         pred = self.model.predict(img)[0]
         image_status = "OPEN" if pred == 1 else "CLOSED"
         
@@ -1713,13 +1770,6 @@ class RoofClassifierApp:
         written = self._write_status_file(
             final_status, override_reason, config['output_path'], now)
 
-        # Clean up temp file for URL mode
-        if tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-
         if not written:
             # The file on disk still shows the previous status. Publishing this
             # result to the ASCOM monitor anyway would let IsSafe and the roof
@@ -1727,6 +1777,11 @@ class RoofClassifierApp:
             return None, "Could not write roof status file"
 
         self._last_classification = (latest, final_status, datetime.now(timezone.utc))
+        self._last_good_pass_at = self._last_classification[2]
+        if self._failsafe_active:
+            self._failsafe_active = False
+            if self.logger:
+                self.logger.warning("Classification recovered - fail-safe status lifted")
 
         print(f"[{final_status}] {latest}")
         return latest, final_status
@@ -1837,7 +1892,13 @@ class RoofClassifierApp:
             return None
 
     def _send_webhook(self, url, payload):
-        """Send an HTTP POST request to *url* with *payload* encoded as JSON."""
+        """POST *payload* as JSON to *url*.
+
+        Returns ``(ok, detail)``: *ok* is True only for a 2xx response, and
+        *detail* describes the outcome ("HTTP 204", or the error). Failures are
+        logged, never raised, so a dead webhook cannot disturb the monitor loop -
+        but callers such as the Test button can still tell the user it failed.
+        """
         try:
             data = json.dumps(payload).encode("utf-8")
             req = urllib.request.Request(
@@ -1847,11 +1908,17 @@ class RoofClassifierApp:
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=10) as response:
+                code = response.status
+            detail = f"HTTP {code}"
+            if 200 <= code < 300:
                 if self.logger:
-                    self.logger.info(f"Webhook sent to {url}: HTTP {response.status}")
+                    self.logger.info(f"Webhook sent to {url}: {detail}")
+                return True, detail
         except Exception as e:
-            if self.logger:
-                self.logger.error(f"Failed to send webhook to {url}: {e}")
+            detail = str(e)
+        if self.logger:
+            self.logger.error(f"Failed to send webhook to {url}: {detail}")
+        return False, detail
 
     def _check_and_send_notifications(self, status, config=None):
         """Check notification conditions and fire webhooks as appropriate.
@@ -2203,11 +2270,25 @@ class RoofClassifierApp:
         if not os.path.isdir(folder):
             return None, None, False, "No model or invalid folder"
 
-        images = [f for f in os.listdir(folder) if f.lower().endswith((".png", ".jpg", ".jpeg"))]
+        try:
+            names = os.listdir(folder)
+        except OSError as e:
+            return None, None, False, f"Could not list folder: {e}"
+
+        # Cameras and cleanup scripts delete old frames while we look, so a file
+        # can vanish between listdir and getmtime; skip it rather than raising.
+        images = []
+        for name in names:
+            if not name.lower().endswith((".png", ".jpg", ".jpeg")):
+                continue
+            try:
+                images.append((os.path.getmtime(os.path.join(folder, name)), name))
+            except OSError:
+                continue
         if not images:
             return None, None, False, "No image files found"
 
-        latest = max(images, key=lambda f: os.path.getmtime(os.path.join(folder, f)))
+        _mtime, latest = max(images)
         return os.path.join(folder, latest), latest, False, None
 
     def on_preview_enabled_changed(self):
@@ -2412,48 +2493,130 @@ class RoofClassifierApp:
         }
 
         def do_send():
-            try:
-                self._send_webhook(url, payload)
+            # _send_webhook never raises, so its result is the only way to know
+            # whether the POST landed. Ignoring it reported "sent" for every
+            # typo'd URL and 500 response.
+            ok, detail = self._send_webhook(url, payload)
+            if ok:
                 self.root.after(
                     0,
                     lambda: messagebox.showinfo(
                         "Webhook Sent",
-                        f"Test webhook sent to:\n{url}\n\nCheck the destination for the payload.",
+                        f"Test webhook sent to:\n{url}\n\nServer replied {detail}. "
+                        "Check the destination for the payload.",
                     ),
                 )
-            except Exception as e:
-                self.root.after(0, lambda e=e: messagebox.showerror("Webhook Error", f"Failed: {e}"))
+            else:
+                self.root.after(
+                    0,
+                    lambda: messagebox.showerror(
+                        "Webhook Error", f"Test webhook to:\n{url}\n\nfailed: {detail}"),
+                )
 
         threading.Thread(target=do_send, daemon=True).start()
 
-    def monitor_loop(self):
-        check_interval = 60  # 60 seconds between checks
-        
-        while not self.stop_monitor:
-            # Take a fresh configuration snapshot on the UI thread each cycle, so the
-            # worker never touches Tk variables but still sees setting changes.
-            config = self._request_monitor_config()
-            if config is None:
-                if self.logger:
-                    self.logger.error("Skipping monitoring cycle: no configuration available")
-                filename, status = None, "No configuration available"
-            else:
-                filename, status = self.classify_latest_png(config, max_cache_age=0)
-            self.root.after(0, lambda f=filename, s=status: self.update_monitoring_status(f, s))
+    def monitor_loop(self, stop_event=None):
+        """Classify every MONITOR_INTERVAL_SECONDS until *stop_event* is set.
 
-            # Send notifications if configured (runs in background thread)
-            if status in ("OPEN", "CLOSED") and config is not None:
-                self._check_and_send_notifications(status, config)
-            
-            # Countdown loop with 1-second updates
-            for remaining in range(check_interval, 0, -1):
-                if self.stop_monitor:
-                    break
-                self.root.after(0, lambda r=remaining: self.update_countdown(r))
-                time.sleep(1)
-            
-        # Clear status when monitoring stops
-        self.root.after(0, self.clear_monitoring_status)
+        Runs on its own thread for the whole night, so no single pass is allowed
+        to end it: an exception is logged, the pass counts as failed, and the
+        loop carries on. (It used to propagate and kill the thread silently,
+        leaving the status file frozen on its last line while the UI still said
+        "Monitoring: Active".)
+        """
+        if stop_event is None:
+            stop_event = self._monitor_stop_event
+        try:
+            while not stop_event.is_set():
+                config = None
+                try:
+                    # Take a fresh configuration snapshot on the UI thread each
+                    # cycle, so the worker never touches Tk variables but still
+                    # sees setting changes.
+                    config = self._request_monitor_config()
+                    if config is None:
+                        if self.logger:
+                            self.logger.error("Skipping monitoring cycle: no configuration available")
+                        filename, status = None, "No configuration available"
+                    else:
+                        filename, status = self.classify_latest_png(config, max_cache_age=0)
+                except Exception as e:
+                    if self.logger:
+                        self.logger.exception(f"Monitoring pass failed: {e}")
+                    filename, status = None, f"Error: {e}"
+
+                if stop_event.is_set():
+                    break  # stopped mid-pass; do not report into a newer run's UI
+
+                if filename is None:
+                    try:
+                        self._apply_failsafe_status(config)
+                    except Exception as e:
+                        if self.logger:
+                            self.logger.error(f"Could not apply fail-safe status: {e}")
+
+                self._defer_to_ui(lambda f=filename, s=status: self.update_monitoring_status(f, s))
+
+                # Send notifications if configured (runs in background thread)
+                if status in ("OPEN", "CLOSED") and config is not None:
+                    try:
+                        self._check_and_send_notifications(status, config)
+                    except Exception as e:
+                        if self.logger:
+                            self.logger.error(f"Error sending notifications: {e}")
+
+                # Countdown with one update per tick; a stop request ends it at once.
+                for remaining in range(MONITOR_INTERVAL_SECONDS, 0, -1):
+                    self._defer_to_ui(lambda r=remaining: self.update_countdown(r))
+                    if stop_event.wait(_COUNTDOWN_TICK_SECONDS):
+                        break
+        finally:
+            self._defer_to_ui(lambda: self._on_monitor_loop_exit(stop_event))
+
+    def _on_monitor_loop_exit(self, stop_event):
+        """Reset the monitoring UI when a loop ends - unless a newer run has
+        started in the meantime, whose state is not this loop's to clear."""
+        if self._monitor_stop_event is stop_event:
+            self.clear_monitoring_status()
+
+    def _apply_failsafe_status(self, config=None, now=None):
+        """Write a fail-safe status line once classification has failed for too long.
+
+        A failed pass leaves the status file untouched, which is right for a
+        one-off glitch. But when the camera feed dies, the file would otherwise
+        keep saying OPEN for the rest of the night with nothing to tell a reader
+        that it is stale. After FAILSAFE_AFTER_SECONDS without a good pass it is
+        rewritten as CLOSED, the same point at which the ASCOM flag already turns
+        unsafe. An active manual override still wins: that is the tool for "the
+        camera is obscured and I know better".
+
+        Returns True when a fail-safe line was written.
+        """
+        with self._classify_lock:
+            now = now or datetime.now(timezone.utc)
+            last_good = self._last_good_pass_at
+            if last_good is not None and (now - last_good).total_seconds() <= FAILSAFE_AFTER_SECONDS:
+                return False
+
+            output_path = (config or self._last_monitor_config or {}).get('output_path')
+            if not output_path:
+                if self.logger:
+                    self.logger.error("Cannot write fail-safe status: no output path configured")
+                return False
+
+            override = self.get_manual_override()
+            if override:
+                status, reason = override, f" (Manual override: {override})"
+            else:
+                status, reason = "CLOSED", " (No valid classification - failsafe)"
+
+            written = self._write_status_file(status, reason, output_path)
+            if written and not self._failsafe_active and self.logger:
+                self.logger.warning(
+                    f"No valid classification for over {FAILSAFE_AFTER_SECONDS}s - "
+                    f"status file set to {status} until classification recovers")
+            self._failsafe_active = self._failsafe_active or written
+            return written
 
     def toggle_monitoring(self):
         """Toggle monitoring on or off from the status bar button"""
@@ -2488,8 +2651,12 @@ class RoofClassifierApp:
         if self.log_enabled.get() and self._log_path_conflicts_with_output():
             self._warn_log_path_conflict("Please set a different path for the classifier log file in the Configuration tab.")
         
-        self.stop_monitor = False
+        stop_event = threading.Event()
+        self._monitor_stop_event = stop_event
         self.monitoring_active = True
+        # Grace period for the fail-safe starts now, not at the last run's success
+        self._last_good_pass_at = datetime.now(timezone.utc)
+        self._failsafe_active = False
         # Reset notification state so transition and stale notifications work correctly
         self.previous_status = None
         self._last_stale_notification_time = None
@@ -2514,11 +2681,15 @@ class RoofClassifierApp:
             else:
                 self.logger.info("Secondary source disabled")
         
-        threading.Thread(target=self.monitor_loop, daemon=True).start()
+        threading.Thread(target=self.monitor_loop, args=(stop_event,), daemon=True).start()
         self.update_observation_window_display()  # Start periodic updates
 
     def stop_monitoring(self):
-        self.stop_monitor = True
+        """Stop the current run. The UI is reset at once; a pass already in
+        progress finishes in the background but reports nothing further."""
+        if self._monitor_stop_event is not None:
+            self._monitor_stop_event.set()
+        self.clear_monitoring_status()
         if self.logger:
             self.logger.info("Monitoring stopped")
 
@@ -3655,9 +3826,17 @@ class RoofClassifierApp:
         """Update the observation window display"""
         if hasattr(self, 'obs_window_label'):
             self.obs_window_label.config(text=self.format_observation_window())
-        # Schedule next update in 60 seconds if monitoring
-        if not self.stop_monitor:
-            self.root.after(60000, self.update_observation_window_display)
+        # Schedule next update in 60 seconds if monitoring. Cancel any pending one
+        # first: every Start calls this, and each call used to add another
+        # self-perpetuating 60s chain.
+        if self._obs_window_after_id is not None:
+            try:
+                self.root.after_cancel(self._obs_window_after_id)
+            except Exception:
+                pass
+            self._obs_window_after_id = None
+        if self.monitoring_active:
+            self._obs_window_after_id = self.root.after(60000, self.update_observation_window_display)
 
     def apply_twilight_preset(self, preset_name):
         """Apply a twilight preset to the sun angle threshold"""
