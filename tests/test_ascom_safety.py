@@ -145,6 +145,18 @@ def test_refresh_reports_unsafe_when_the_app_raises(monitor):
     assert "boom" in monitor.last_error
 
 
+def test_refresh_reports_unsafe_without_a_classifier(monitor):
+    """A standalone or misconfigured server has no basis to report safe."""
+    monitor.roof_classifier_app = None
+    monitor.connected = True
+    monitor.is_safe = True
+
+    monitor.refresh_safety_status()
+
+    assert monitor.is_safe is False
+    assert monitor.last_error
+
+
 # ── transaction IDs ───────────────────────────────────────────────────────────
 
 def test_server_transaction_ids_are_unique_across_threads(monitor):

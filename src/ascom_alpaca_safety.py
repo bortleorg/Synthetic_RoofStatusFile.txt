@@ -535,8 +535,10 @@ class AscomAlpacaSafetyMonitor:
         """Recompute IsSafe once from the classifier's latest result."""
         try:
             if not self.roof_classifier_app:
-                # Standalone/test mode: nothing to base a judgement on.
-                self.is_safe = True
+                # Standalone/misconfigured: nothing to base a judgement on, so fail closed.
+                self.is_safe = False
+                self.last_error = "No roof classifier attached"
+                self.last_update = datetime.now(timezone.utc)
                 return
 
             if not self.connected:

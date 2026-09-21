@@ -1537,13 +1537,24 @@ class RoofClassifierApp:
         toggle/disagreement state. A caller arriving while a result less than
         *max_cache_age* seconds old is available reuses that result instead of
         re-running the pipeline; pass ``max_cache_age=0`` to force a fresh pass.
+        A fresh pass that fails clears the cached result.
         """
         with self._classify_lock:
             cached = self.get_cached_classification(max_cache_age)
             if cached is not None:
                 filename, status, _age = cached
                 return filename, status
-            return self._classify_latest_png_uncached(config)
+            try:
+                result = self._classify_latest_png_uncached(config)
+            except BaseException:
+                self._last_classification = None
+                raise
+            if result[0] is None:
+                # A pass that could not classify must not leave the previous
+                # result standing: the ASCOM thread would keep reporting it as
+                # current until it aged out.
+                self._last_classification = None
+            return result
 
     def get_cached_classification(self, max_age_seconds):
         """Return ``(filename, status, age_seconds)`` if a recent enough result exists.
@@ -1727,7 +1738,7 @@ class RoofClassifierApp:
         try:
             # Written atomically: ASCOM clients and SkyRoof poll this file, and a
             # plain truncate-then-write lets them read an empty or partial line.
-            atomic_write_text(output_path, line)
+            atomic_write_text(output_path, line, allow_in_place_fallback=True)
             return True
         except Exception as e:
             if self.logger:

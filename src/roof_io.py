@@ -47,7 +47,7 @@ def _replace_with_retry(tmp_path, path):
     raise last_error
 
 
-def atomic_write_text(path, text, encoding="utf-8"):
+def atomic_write_text(path, text, encoding="utf-8", allow_in_place_fallback=False):
     """Write *text* to *path* so readers never observe a partial file.
 
     The content goes to a temporary file in the same directory, is flushed and
@@ -58,9 +58,12 @@ def atomic_write_text(path, text, encoding="utf-8"):
     transient open error; that is a retry, not a wrong answer.)
 
     If the rename keeps failing because a reader is holding the destination open,
-    the content is written in place instead. That reintroduces the small window a
-    plain write has always had, but it is strictly better than skipping the
-    update and leaving a stale roof status on disk.
+    the PermissionError propagates and the destination is left untouched. With
+    *allow_in_place_fallback* the content is written in place instead. That
+    reintroduces the small window a plain write has always had, so it is only for
+    the roof status file, where a stale line on disk is worse than a torn one.
+    Never use it for the settings file: a torn settings file loses the persisted
+    ASCOM UniqueID and any manual override.
     """
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
@@ -77,6 +80,8 @@ def atomic_write_text(path, text, encoding="utf-8"):
         try:
             _replace_with_retry(tmp_path, path)
         except PermissionError:
+            if not allow_in_place_fallback:
+                raise
             with open(path, "w", encoding=encoding, newline="") as handle:
                 handle.write(text)
                 handle.flush()
@@ -94,7 +99,11 @@ def atomic_write_text(path, text, encoding="utf-8"):
 
 
 def write_json_atomic(path, obj):
-    """Serialise *obj* as indented JSON and write it atomically."""
+    """Serialise *obj* as indented JSON and write it atomically.
+
+    There is no in-place fallback: if the destination cannot be replaced the
+    save fails and the previous file stays intact.
+    """
     atomic_write_text(path, json.dumps(obj, indent=2))
 
 

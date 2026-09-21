@@ -134,10 +134,29 @@ def test_write_falls_back_in_place_when_the_rename_cannot_win(tmp_path, monkeypa
         lambda src, dst: (_ for _ in ()).throw(PermissionError("locked")),
     )
 
-    roof_io.atomic_write_text(str(target), "NEW\n")
+    roof_io.atomic_write_text(str(target), "NEW\n", allow_in_place_fallback=True)
 
     assert target.read_text(encoding="utf-8") == "NEW\n"
     assert [p.name for p in tmp_path.iterdir()] == ["status.txt"]
+
+
+def test_write_without_fallback_leaves_the_destination_intact(tmp_path, monkeypatch):
+    """Settings saves must fail rather than risk truncating the file in place."""
+    target = tmp_path / "settings.json"
+    roof_io.write_json_atomic(str(target), {"ascom_unique_id": "abc"})
+
+    monkeypatch.setattr(roof_io, "_REPLACE_RETRIES", 2)
+    monkeypatch.setattr(roof_io, "_REPLACE_RETRY_DELAY", 0)
+    monkeypatch.setattr(
+        roof_io.os, "replace",
+        lambda src, dst: (_ for _ in ()).throw(PermissionError("locked")),
+    )
+
+    with pytest.raises(PermissionError):
+        roof_io.write_json_atomic(str(target), {"ascom_unique_id": "xyz"})
+
+    assert json.loads(target.read_text(encoding="utf-8")) == {"ascom_unique_id": "abc"}
+    assert [p.name for p in tmp_path.iterdir()] == ["settings.json"]
 
 
 # ── JSON helpers ──────────────────────────────────────────────────────────────

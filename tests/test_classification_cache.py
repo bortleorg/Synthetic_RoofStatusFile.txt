@@ -68,6 +68,31 @@ def test_expired_cache_triggers_a_fresh_pass(classifier):
     assert len(classifier.calls) == 2
 
 
+def test_failed_fresh_pass_clears_the_cached_result(classifier):
+    """A monitor cycle that cannot classify must not leave the old OPEN standing."""
+    classifier.classify_latest_png({})
+    classifier._classify_latest_png_uncached = lambda config=None: (None, "No image")
+
+    result = classifier.classify_latest_png({}, max_cache_age=0)
+
+    assert result == (None, "No image")
+    assert classifier._last_classification is None
+    assert classifier.get_cached_status() == (None, None)
+
+
+def test_raising_fresh_pass_clears_the_cached_result(classifier):
+    classifier.classify_latest_png({})
+
+    def boom(config=None):
+        raise RuntimeError("model exploded")
+
+    classifier._classify_latest_png_uncached = boom
+
+    with pytest.raises(RuntimeError):
+        classifier.classify_latest_png({}, max_cache_age=0)
+    assert classifier._last_classification is None
+
+
 def test_concurrent_callers_do_not_interleave(app):
     """Two threads asking at once produce exactly one pipeline run at a time."""
     app._classify_lock = threading.RLock()
