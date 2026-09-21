@@ -2635,11 +2635,20 @@ class RoofClassifierApp:
             # local time the status file is written in.
             timestamp = now.astimezone().strftime("%Y-%m-%d %I:%M:%S%p")
             written = self._write_status_file(status, reason, output_path, timestamp)
-            if written and not self._failsafe_active and self.logger:
-                self.logger.warning(
-                    f"No valid classification for over {FAILSAFE_AFTER_SECONDS}s - "
-                    f"status file set to {status} until classification recovers")
-            self._failsafe_active = self._failsafe_active or written
+            if written:
+                # _failsafe_active means "the file holds the fail-safe CLOSED
+                # line". An override line is not that, even when written here,
+                # so it must not trigger the fail-safe UI note or the later
+                # "recovered" log. A failed write leaves the file, and the flag,
+                # as they were.
+                if override:
+                    self._failsafe_active = False
+                else:
+                    if not self._failsafe_active and self.logger:
+                        self.logger.warning(
+                            f"No valid classification for over {FAILSAFE_AFTER_SECONDS}s - "
+                            f"status file set to CLOSED until classification recovers")
+                    self._failsafe_active = True
             return written
 
     def toggle_monitoring(self):

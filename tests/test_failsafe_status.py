@@ -63,6 +63,32 @@ def test_manual_override_still_wins(failsafe):
 
     assert failsafe._apply_failsafe_status(failsafe.config) is True
     assert "Roof Status: OPEN (Manual override: OPEN)" in failsafe.output.read_text()
+    assert failsafe._failsafe_active is False, "override line reported as fail-safe"
+
+
+def test_override_applied_during_a_failsafe_clears_the_flag(failsafe):
+    """Once the override line replaces the fail-safe CLOSED, the flag must follow."""
+    failsafe._last_good_pass_at = None
+    failsafe._apply_failsafe_status(failsafe.config)
+    assert failsafe._failsafe_active is True
+
+    failsafe.override = "OPEN"
+    failsafe._apply_failsafe_status(failsafe.config)
+
+    assert failsafe._failsafe_active is False
+    assert "Manual override: OPEN" in failsafe.output.read_text()
+
+
+def test_failed_override_write_keeps_the_existing_failsafe_flag(failsafe):
+    """If the override line never reached disk, the fail-safe line is still there."""
+    failsafe._last_good_pass_at = None
+    failsafe._apply_failsafe_status(failsafe.config)
+    failsafe.override = "OPEN"
+    failsafe._write_status_file = lambda *a, **k: False
+
+    failsafe._apply_failsafe_status(failsafe.config)
+
+    assert failsafe._failsafe_active is True
 
 
 def test_falls_back_to_the_last_known_output_path(failsafe):
