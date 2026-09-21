@@ -148,3 +148,45 @@ def test_frozen_frame_does_not_count_as_a_model_toggle(pipeline):
 
     assert saved == []
     assert pipeline.previous_classified_status == "OPEN"
+
+
+# ── the "while stale, report ..." setting ─────────────────────────────────────
+
+def test_keep_setting_reports_the_frozen_frame_as_classified(pipeline):
+    pipeline.config['stale_image_action'] = srs.STALE_ACTION_KEEP
+    classify(pipeline)
+    freeze_for(pipeline, 60)
+
+    assert classify(pipeline)[1] == "OPEN"
+    assert pipeline.writes[-1] == ("OPEN", "")
+
+
+def test_closed_setting_is_the_failsafe(pipeline):
+    pipeline.config['stale_image_action'] = srs.STALE_ACTION_CLOSED
+    classify(pipeline)
+    freeze_for(pipeline, 60)
+
+    assert classify(pipeline)[1] == "CLOSED"
+
+
+@pytest.mark.parametrize("config", [{}, {'stale_image_action': ''}, {'stale_image_action': 'bogus'}])
+def test_missing_or_unknown_setting_fails_safe(config):
+    assert srs.RoofClassifierApp._stale_failsafe_enabled(config) is True
+
+
+def test_keep_setting_does_not_silence_the_stale_notification(app):
+    """The option only changes the reported status; the webhook still fires."""
+    sent = []
+    app._send_webhook = lambda url, payload: sent.append(payload["event"]) or (True, "HTTP 200")
+    app.previous_status = "OPEN"
+    app._last_stale_notification_time = None
+    app._last_heartbeat_time = None
+    app.last_new_hash_time = datetime.utcnow() - timedelta(minutes=30)
+
+    app._check_and_send_notifications("OPEN", {
+        'stale_image_action': srs.STALE_ACTION_KEEP,
+        'notif_stale_enabled': True, 'notif_stale_url': 'http://hook',
+        'notif_stale_minutes': '10',
+    })
+
+    assert sent == ["image_stale"]

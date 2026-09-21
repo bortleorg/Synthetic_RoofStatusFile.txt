@@ -41,6 +41,7 @@ VARS = {
     'validation_set_path': '', 'camera_url': '', 'preview_enabled': True,
     'override_duration': '1 hour', 'override_mode': 'AUTO',
     'notif_stale_enabled': False, 'notif_stale_minutes': '10', 'notif_stale_url': '',
+    'stale_image_action': 'closed',
     'notif_open_enabled': False, 'notif_open_url': '',
     'notif_closed_enabled': False, 'notif_closed_url': '',
     'notif_heartbeat_enabled': False, 'notif_heartbeat_minutes': '5',
@@ -131,3 +132,33 @@ def test_missing_settings_file_leaves_defaults_alone(settings_app):
     settings_app.load_settings()
     assert settings_app.latitude.get() == "40.0"
     assert settings_app.output_path.get() == "RoofStatusFile.txt"
+
+
+def test_stale_image_action_round_trips(settings_app):
+    settings_app.stale_image_action.set(srs.STALE_ACTION_KEEP)
+    settings_app.save_settings()
+
+    settings_app.stale_image_action.set(srs.STALE_ACTION_CLOSED)
+    settings_app.load_settings()
+
+    assert settings_app.stale_image_action.get() == srs.STALE_ACTION_KEEP
+
+
+def test_stale_image_action_defaults_to_failsafe_for_old_settings_files(settings_app):
+    """Settings saved before the option existed get the fail-safe behaviour."""
+    with open(srs.SETTINGS_FILE, "w", encoding="utf-8") as handle:
+        json.dump({"latitude": "51.5"}, handle)
+    settings_app.stale_image_action.set(srs.STALE_ACTION_KEEP)
+
+    settings_app.load_settings()
+
+    assert settings_app.stale_image_action.get() == srs.STALE_ACTION_CLOSED
+
+
+def test_unrecognised_stale_image_action_falls_back_to_failsafe(settings_app):
+    with open(srs.SETTINGS_FILE, "w", encoding="utf-8") as handle:
+        json.dump({"stale_image_action": "whatever"}, handle)
+
+    settings_app.load_settings()
+
+    assert settings_app.stale_image_action.get() == srs.STALE_ACTION_CLOSED

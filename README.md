@@ -50,7 +50,9 @@ A frame that cannot be read (for example because the camera is still writing it)
 
 The Monitoring tab also shows **"Image last changed: X min ago"** — the elapsed time since the image hash last changed. This turns orange when the image has not changed for longer than the stale threshold (configured in the Notifications tab). The status bar additionally shows a `⚠ stale image` warning in orange when the image is stale.
 
-A stale image is also not trusted for the roof status. A hung camera, a URL serving a cached frame, or capture software that stopped writing hands the classifier the same frame on every pass, and that frame would otherwise be reported (possibly as `OPEN`) all night. Once the image has not changed for the stale threshold, the output file reports `Roof Status: CLOSED (Image unchanged for N min - failsafe)` and ASCOM clients see `CLOSED`, whether or not the stale notification is enabled. A manual override still wins, and the normal status returns with the next new frame.
+By default a stale image is also not trusted for the roof status. A hung camera, a URL serving a cached frame, or capture software that stopped writing hands the classifier the same frame on every pass, and that frame would otherwise be reported (possibly as `OPEN`) all night. Once the image has not changed for the stale threshold, the output file reports `Roof Status: CLOSED (Image unchanged for N min - failsafe)` and ASCOM clients see `CLOSED`, whether or not the stale notification is enabled. A manual override still wins, and the normal status returns with the next new frame.
+
+To keep reporting the model's classification of the frozen frame instead, choose **"While the image is stale, report: The model's classification of the last frame"** in the Stale Image section of the Notifications tab. The stale threshold set there controls when the image counts as stale, for both the notification and this fail-safe.
 
 #### Latest All-Sky Image preview
 
@@ -106,12 +108,15 @@ Webhooks are HTTP POST requests with a JSON body. The `event` field identifies t
 
 | Section | `event` value | Trigger condition |
 |---|---|---|
-| Stale Image | `image_stale` | Image hash unchanged for ≥ stale threshold; re-fires every threshold interval while still stale. The reported status is also forced to CLOSED at that point (see Monitoring), so a `roof_closed` event may accompany it |
+| Stale Image | `image_stale` | Image hash unchanged for ≥ stale threshold; re-fires every threshold interval while still stale. With the default fail-safe, the reported status is also forced to CLOSED at that point (see Monitoring), so a `roof_closed` event may accompany it |
 | Roof Open | `roof_open` | Status transitions to OPEN (not sent on every cycle) |
 | Roof Closed | `roof_closed` | Status transitions to CLOSED (not sent on every cycle) |
 | Heartbeat | `heartbeat` | Every X minutes while monitoring is active **and** the image is not stale |
 
-**Stale Image Notification** — Set the stale threshold in minutes (default: 10). If the image hash has not changed for that long, a webhook fires. It re-fires once per threshold interval for as long as the image remains unchanged.
+**Stale Image** — Set the stale threshold in minutes (default: 10). If the image hash has not changed for that long, the image counts as stale:
+
+- If the notification is enabled, a webhook fires. It re-fires once per threshold interval for as long as the image remains unchanged.
+- **"While the image is stale, report"** chooses the reported roof status: **CLOSED (fail-safe)** (the default) or **the model's classification of the last frame**. This applies whether or not the notification is enabled.
 
 **Roof Open / Closed Notifications** — Fire once each time the status transitions to OPEN or CLOSED, respectively.
 

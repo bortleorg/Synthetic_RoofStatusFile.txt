@@ -85,6 +85,12 @@ FAILSAFE_AFTER_SECONDS = CLASSIFICATION_MAX_AGE_SECONDS
 # CLOSED rather than trusted.
 DEFAULT_STALE_MINUTES = 10.0
 
+# What to report while the image is stale: CLOSED (fail-safe), or keep reporting
+# whatever the model makes of the frozen frame.
+STALE_ACTION_CLOSED = "closed"
+STALE_ACTION_KEEP = "keep"
+STALE_ACTIONS = (STALE_ACTION_CLOSED, STALE_ACTION_KEEP)
+
 # How long a secondary roof status fetched over HTTP is reused before re-fetching.
 # Keeps the UI thread from issuing a network request on every status-label refresh.
 _SECONDARY_URL_CACHE_SECONDS = 30
@@ -183,6 +189,7 @@ class RoofClassifierApp:
         self.notif_stale_enabled = tk.BooleanVar(value=False)
         self.notif_stale_minutes = tk.StringVar(value="10")
         self.notif_stale_url = tk.StringVar(value="")
+        self.stale_image_action = tk.StringVar(value=STALE_ACTION_CLOSED)
         self.notif_open_enabled = tk.BooleanVar(value=False)
         self.notif_open_url = tk.StringVar(value="")
         self.notif_closed_enabled = tk.BooleanVar(value=False)
@@ -298,6 +305,10 @@ class RoofClassifierApp:
                 self.notif_stale_enabled.set(settings.get('notif_stale_enabled', False))
                 self.notif_stale_minutes.set(settings.get('notif_stale_minutes', '10'))
                 self.notif_stale_url.set(settings.get('notif_stale_url', ''))
+                stale_action = settings.get('stale_image_action', STALE_ACTION_CLOSED)
+                # Anything unrecognised falls back to the fail-safe choice.
+                self.stale_image_action.set(
+                    stale_action if stale_action in STALE_ACTIONS else STALE_ACTION_CLOSED)
                 self.notif_open_enabled.set(settings.get('notif_open_enabled', False))
                 self.notif_open_url.set(settings.get('notif_open_url', ''))
                 self.notif_closed_enabled.set(settings.get('notif_closed_enabled', False))
@@ -343,6 +354,7 @@ class RoofClassifierApp:
                 'notif_stale_enabled': self.notif_stale_enabled.get(),
                 'notif_stale_minutes': self.notif_stale_minutes.get(),
                 'notif_stale_url': self.notif_stale_url.get(),
+                'stale_image_action': self.stale_image_action.get(),
                 'notif_open_enabled': self.notif_open_enabled.get(),
                 'notif_open_url': self.notif_open_url.get(),
                 'notif_closed_enabled': self.notif_closed_enabled.get(),
@@ -670,6 +682,7 @@ class RoofClassifierApp:
             'notif_stale_enabled': self.notif_stale_enabled.get(),
             'notif_stale_minutes': self.notif_stale_minutes.get(),
             'notif_stale_url': self.notif_stale_url.get().strip(),
+            'stale_image_action': self.stale_image_action.get(),
             'notif_open_enabled': self.notif_open_enabled.get(),
             'notif_open_url': self.notif_open_url.get().strip(),
             'notif_closed_enabled': self.notif_closed_enabled.get(),
@@ -1239,7 +1252,7 @@ class RoofClassifierApp:
         notebook.add(tab_notif, text="Notifications")
 
         # Stale image notification section
-        stale_frame = tk.LabelFrame(tab_notif, text="Stale Image Notification", padx=5, pady=5)
+        stale_frame = tk.LabelFrame(tab_notif, text="Stale Image", padx=5, pady=5)
         stale_frame.pack(fill="x", padx=10, pady=5)
 
         tk.Checkbutton(stale_frame, text="Notify when the latest image has not changed for X minutes",
@@ -1249,6 +1262,19 @@ class RoofClassifierApp:
         stale_min_frame.pack(fill="x", pady=2)
         tk.Label(stale_min_frame, text="Stale threshold (minutes):").pack(side=tk.LEFT)
         tk.Entry(stale_min_frame, textvariable=self.notif_stale_minutes, width=6).pack(side=tk.LEFT, padx=(5, 0))
+
+        stale_action_frame = tk.Frame(stale_frame)
+        stale_action_frame.pack(fill="x", pady=2)
+        tk.Label(stale_action_frame,
+                 text="While the image is stale (camera frozen), report:").pack(anchor="w")
+        tk.Radiobutton(stale_action_frame,
+                       text="CLOSED (fail-safe) — don't trust a frozen frame",
+                       variable=self.stale_image_action, value=STALE_ACTION_CLOSED,
+                       command=self.save_settings).pack(anchor="w", padx=(15, 0))
+        tk.Radiobutton(stale_action_frame,
+                       text="The model's classification of the last frame",
+                       variable=self.stale_image_action, value=STALE_ACTION_KEEP,
+                       command=self.save_settings).pack(anchor="w", padx=(15, 0))
 
         stale_url_outer = tk.Frame(stale_frame)
         stale_url_outer.pack(fill="x", pady=2)
@@ -1766,10 +1792,13 @@ class RoofClassifierApp:
         # stopped writing) still classifies cleanly - the same frame, every pass - so
         # none of the failure paths fire, and an OPEN frame would be reported all
         # night. Once the image has not changed for the stale threshold, report
-        # CLOSED instead. Applied after model_status so the toggle baseline stays
-        # the model's view, and before the override, which still wins.
+        # CLOSED instead - unless the user chose to keep trusting the frozen frame.
+        # Applied after model_status so the toggle baseline stays the model's view,
+        # and before the override, which still wins.
         stale_minutes = self._image_unchanged_minutes()
-        if stale_minutes is not None and stale_minutes >= self._stale_threshold_minutes(config):
+        if (self._stale_failsafe_enabled(config)
+                and stale_minutes is not None
+                and stale_minutes >= self._stale_threshold_minutes(config)):
             if final_status == "OPEN" and self.logger:
                 self.logger.warning(
                     f"Image unchanged for {stale_minutes:.0f} min - reporting CLOSED "
@@ -2077,6 +2106,12 @@ class RoofClassifierApp:
         if not math.isfinite(minutes) or minutes <= 0:
             return DEFAULT_STALE_MINUTES
         return minutes
+
+    @staticmethod
+    def _stale_failsafe_enabled(config):
+        """True unless the user chose to keep reporting the model's view of a stale
+        frame. Missing or unrecognised values fail safe."""
+        return config.get('stale_image_action', STALE_ACTION_CLOSED) != STALE_ACTION_KEEP
 
     def _image_unchanged_minutes(self, now=None):
         """Minutes since the image hash last changed, or None before the first frame."""
