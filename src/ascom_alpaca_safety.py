@@ -31,7 +31,9 @@ def compute_safety(status, sun_safe, age_seconds, max_age_seconds=MAX_STATUS_AGE
         if age_seconds is None:
             return False, "No roof status available yet"
         return False, f"Roof status is stale ({age_seconds:.0f}s old)"
-    if age_seconds is not None and age_seconds > max_age_seconds:
+    if age_seconds is None:
+        return False, "Roof status age unavailable"
+    if age_seconds > max_age_seconds:
         return False, f"Roof status is stale ({age_seconds:.0f}s old)"
     if status != "OPEN":
         return False, ""
