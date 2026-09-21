@@ -177,6 +177,8 @@ def _stub_pipeline(app, tmp_path, write_ok):
 
     app._classify_lock = threading.RLock()
     app._last_classification = None
+    app._last_good_pass_at = None
+    app._failsafe_active = False
     app.model = Model()
     app.last_image_hash = None
     app.previous_classified_status = None
@@ -215,3 +217,22 @@ def test_failed_write_does_not_publish_the_result(app, tmp_path):
     assert filename is None
     assert "status file" in error
     assert app.get_cached_status() == (None, None)
+
+
+def test_successful_pass_lifts_the_failsafe(app, tmp_path):
+    """Once classification recovers, the fail-safe grace period restarts."""
+    config = _stub_pipeline(app, tmp_path, write_ok=True)
+    app._failsafe_active = True
+
+    app.classify_latest_png(config, max_cache_age=0)
+
+    assert app._failsafe_active is False
+    assert app._last_good_pass_at == app._last_classification[2]
+
+
+def test_failed_pass_does_not_extend_the_failsafe_grace(app, tmp_path):
+    config = _stub_pipeline(app, tmp_path, write_ok=False)
+
+    app.classify_latest_png(config, max_cache_age=0)
+
+    assert app._last_good_pass_at is None

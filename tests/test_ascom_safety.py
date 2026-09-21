@@ -294,3 +294,61 @@ def test_status_endpoint_does_not_classify(monitor):
 
     assert payload["Value"]["RoofStatus"] == "OPEN"
     assert app_stub.classify_calls == 0
+
+
+# ── IsSafe while no client is connected ───────────────────────────────────────
+
+def test_issafe_is_false_when_not_connected(monitor):
+    """ASCOM SafetyMonitor: IsSafe must be False while the device is not connected.
+
+    The stored flag is only refreshed while connected, so a client polling
+    without connecting used to read a value that could be hours old.
+    """
+    monitor.is_safe = True
+    monitor.last_error = ""
+    monitor.connected = False
+    client = monitor.app.test_client()
+
+    payload = client.get("/api/v1/safetymonitor/0/issafe").get_json()
+
+    assert payload["Value"] is False
+    assert payload["ErrorMessage"]
+
+
+def test_disconnect_drops_the_flag(monitor):
+    app_stub = FakeApp("OPEN", 5, True)
+    monitor.roof_classifier_app = app_stub
+    client = monitor.app.test_client()
+
+    client.put("/api/v1/safetymonitor/0/connected", data={"Connected": "True"})
+    assert client.get("/api/v1/safetymonitor/0/issafe").get_json()["Value"] is True
+
+    client.put("/api/v1/safetymonitor/0/connected", data={"Connected": "False"})
+
+    assert monitor.is_safe is False
+    assert client.get("/api/v1/safetymonitor/0/issafe").get_json()["Value"] is False
+
+
+def test_reconnecting_after_the_roof_closed_reports_unsafe(monitor):
+    """The value from before a disconnect must not survive into the next session."""
+    app_stub = FakeApp("OPEN", 5, True)
+    monitor.roof_classifier_app = app_stub
+    client = monitor.app.test_client()
+
+    client.put("/api/v1/safetymonitor/0/connected", data={"Connected": "True"})
+    client.put("/api/v1/safetymonitor/0/connected", data={"Connected": "False"})
+    app_stub.status = "CLOSED"
+    client.put("/api/v1/safetymonitor/0/connected", data={"Connected": "True"})
+
+    assert client.get("/api/v1/safetymonitor/0/issafe").get_json()["Value"] is False
+
+
+def test_status_endpoint_reports_unsafe_when_not_connected(monitor):
+    monitor.roof_classifier_app = FakeApp("OPEN", 5, True)
+    monitor.is_safe = True
+    monitor.connected = False
+    client = monitor.app.test_client()
+
+    payload = client.get("/api/v1/safetymonitor/0/status").get_json()
+
+    assert payload["Value"]["IsSafe"] is False
