@@ -160,3 +160,58 @@ def test_cached_status_honours_a_custom_max_age(app):
 
     assert app.get_cached_status(60)[0] == "OPEN"
     assert app.get_cached_status(10)[0] is None
+
+
+# ── a pass whose status file write fails ──────────────────────────────────────
+
+def _stub_pipeline(app, tmp_path, write_ok):
+    """Stub everything a real pass touches except the result bookkeeping."""
+    import numpy as np
+
+    image = tmp_path / "frame.png"
+    image.write_bytes(b"not really a png")
+
+    class Model:
+        def predict(self, _x):
+            return [1]  # OPEN
+
+    app._classify_lock = threading.RLock()
+    app._last_classification = None
+    app.model = Model()
+    app.last_image_hash = None
+    app.previous_classified_status = None
+    app._in_disagreement = False
+    app._resolve_latest_image = lambda url, path: (str(image), "frame.png", False, None)
+    app.save_sample_if_needed = lambda *a, **k: None
+    app._capture_preview = lambda *a, **k: None
+    app.read_secondary_source = lambda config: (None, None)
+    app.prep_image = lambda path: np.zeros((2, 2))
+    app.is_sun_safe_for_open = lambda config=None: True
+    app.get_manual_override = lambda: None
+    app.calculate_sun_angle = lambda config=None: -30.0
+    app._save_frame_for_review = lambda *a, **k: None
+    app._write_status_file = lambda *a, **k: write_ok
+    return {
+        'camera_url': '', 'monitor_path': str(tmp_path),
+        'output_path': str(tmp_path / "status.txt"),
+        'save_on_disagreement': False, 'save_on_toggle': False,
+    }
+
+
+def test_successful_write_publishes_the_result(app, tmp_path):
+    config = _stub_pipeline(app, tmp_path, write_ok=True)
+
+    assert app.classify_latest_png(config, max_cache_age=0) == ("frame.png", "OPEN")
+    assert app.get_cached_status()[0] == "OPEN"
+
+
+def test_failed_write_does_not_publish_the_result(app, tmp_path):
+    """ASCOM must not report a status the roof status file never received."""
+    config = _stub_pipeline(app, tmp_path, write_ok=False)
+    app._last_classification = ("old.png", "CLOSED", datetime.now(timezone.utc))
+
+    filename, error = app.classify_latest_png(config, max_cache_age=0)
+
+    assert filename is None
+    assert "status file" in error
+    assert app.get_cached_status() == (None, None)

@@ -1710,7 +1710,8 @@ class RoofClassifierApp:
             self._save_frame_for_review(img_path, "toggle", config)
         self.previous_classified_status = model_status
 
-        self._write_status_file(final_status, override_reason, config['output_path'], now)
+        written = self._write_status_file(
+            final_status, override_reason, config['output_path'], now)
 
         # Clean up temp file for URL mode
         if tmp_path:
@@ -1718,7 +1719,13 @@ class RoofClassifierApp:
                 os.unlink(tmp_path)
             except OSError:
                 pass
-        
+
+        if not written:
+            # The file on disk still shows the previous status. Publishing this
+            # result to the ASCOM monitor anyway would let IsSafe and the roof
+            # status file disagree, so report the pass as failed instead.
+            return None, "Could not write roof status file"
+
         self._last_classification = (latest, final_status, datetime.now(timezone.utc))
 
         print(f"[{final_status}] {latest}")
