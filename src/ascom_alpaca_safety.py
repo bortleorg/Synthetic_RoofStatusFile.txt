@@ -9,7 +9,9 @@ import socket
 from datetime import datetime, timezone
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from werkzeug.exceptions import HTTPException
 import logging
+import logging.handlers
 import uuid
 
 # Seconds between safety-status refreshes.
@@ -20,6 +22,56 @@ MAX_STATUS_AGE_SECONDS = 180
 
 # Reported alongside IsSafe=False while no client has connected the device.
 NOT_CONNECTED_MESSAGE = "Device is not connected"
+
+# The server log. Clients poll several times a minute for months on end, so the
+# file is size-capped and rotated, and per-request detail is only logged at DEBUG.
+LOG_FILE = "ascom_alpaca_safety.log"
+LOG_LEVEL = logging.INFO
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_BACKUP_COUNT = 3
+
+# ASCOM error numbers. Alpaca requires driver errors in 0x400-0xFFF; the server
+# used to report 1 for everything, which clients cannot map to an ASCOM exception.
+ERROR_NOT_IMPLEMENTED = 0x400
+ERROR_ACTION_NOT_IMPLEMENTED = 0x40C
+ERROR_UNSPECIFIED = 0x4FF
+
+# Alpaca transaction IDs are uint32.
+_MAX_TRANSACTION_ID = 2 ** 32 - 1
+
+
+def _lookup_case_insensitive(mapping, name):
+    """Return mapping[name], matching the key without regard to case, or None.
+
+    The Alpaca spec makes parameter names case-insensitive, so a client sending
+    ``clienttransactionid`` or ``connected`` must be understood.
+    """
+    if not mapping:
+        return None
+    if name in mapping:
+        return mapping.get(name)
+    wanted = name.lower()
+    for key in mapping.keys():
+        if isinstance(key, str) and key.lower() == wanted:
+            return mapping.get(key)
+    return None
+
+
+def parse_bool(value):
+    """Parse an Alpaca boolean strictly ("True"/"False", any case).
+
+    Raises ValueError for anything else. The lenient parser this replaces read
+    every unrecognised value - a typo, "maybe" - as False, so a garbled
+    Connected=... silently disconnected the device.
+    """
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text == 'true':
+        return True
+    if text == 'false':
+        return False
+    raise ValueError(f"'{value}' is not a valid boolean (expected True or False)")
 
 
 def compute_safety(status, sun_safe, age_seconds, max_age_seconds=MAX_STATUS_AGE_SECONDS):
@@ -105,7 +157,10 @@ class AscomAlpacaSafetyMonitor:
     def setup_logging(self):
         """Setup logging for the ASCOM server"""
         self.logger = logging.getLogger('AscomAlpacaSafetyMonitor')
-        self.logger.setLevel(logging.DEBUG)  # Set to DEBUG for troubleshooting
+        # DEBUG logged every request with its full headers, several lines per
+        # poll, into a file that was never rotated. Set LOG_LEVEL to
+        # logging.DEBUG when troubleshooting a client.
+        self.logger.setLevel(LOG_LEVEL)
 
         # The logger is module-global, so a second server instance would otherwise
         # attach a second set of handlers and double every log line.
@@ -122,7 +177,9 @@ class AscomAlpacaSafetyMonitor:
         
         # File handler
         try:
-            file_handler = logging.FileHandler('ascom_alpaca_safety.log')
+            file_handler = logging.handlers.RotatingFileHandler(
+                LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT,
+                encoding="utf-8")
             file_handler.setFormatter(formatter)
             self.logger.addHandler(file_handler)
         except Exception as e:
@@ -202,24 +259,22 @@ class AscomAlpacaSafetyMonitor:
         
         # Try JSON first
         if request.is_json:
-            data = request.get_json()
-            if data and param_name in data:
-                value = data[param_name]
-        
+            data = request.get_json(silent=True)
+            if isinstance(data, dict):
+                value = _lookup_case_insensitive(data, param_name)
+
         # Try form data (ASCOM standard)
         if value is None and request.form:
-            value = request.form.get(param_name)
-        
+            value = _lookup_case_insensitive(request.form, param_name)
+
         # Try query parameters
         if value is None:
-            value = request.args.get(param_name)
-        
+            value = _lookup_case_insensitive(request.args, param_name)
+
         # Convert type if needed
         if value is not None:
             if param_type == bool:
-                if isinstance(value, bool):
-                    return value
-                return str(value).lower() in ('true', '1', 'yes', 'on')
+                return parse_bool(value)
             elif param_type == int:
                 return int(value)
             elif param_type == float:
@@ -239,11 +294,8 @@ class AscomAlpacaSafetyMonitor:
             'ErrorMessage': error_message
         }
         
-        # Add client transaction ID if provided
-        client_transaction_id = self.get_request_parameter('ClientTransactionID', int)
-        if client_transaction_id is not None:
-            response['ClientTransactionID'] = client_transaction_id
-        
+        response['ClientTransactionID'] = self._client_transaction_id()
+
         # Add server transaction ID (incremental, unique across worker threads)
         with self._transaction_lock:
             self._server_transaction_id += 1
@@ -251,17 +303,35 @@ class AscomAlpacaSafetyMonitor:
         
         return jsonify(response)
     
+    def _client_transaction_id(self):
+        """The request's ClientTransactionID, or 0 when absent or invalid.
+
+        The spec says to return 0 in that case. A non-numeric value used to raise
+        here - and again inside the error handler - so the client got a bare
+        HTTP 500 instead of an answer.
+        """
+        try:
+            value = self.get_request_parameter('ClientTransactionID', int)
+        except (TypeError, ValueError):
+            return 0
+        if value is None or not 0 <= value <= _MAX_TRANSACTION_ID:
+            return 0
+        return value
+
     def setup_routes(self):
         """Setup Flask routes for ASCOM Alpaca API"""
         
         # Add request logging middleware
         @self.app.before_request
         def log_request():
+            # Skip building the dumps below unless someone is going to read them.
+            if not self.logger.isEnabledFor(logging.DEBUG):
+                return
             self.logger.debug(f"Request: {request.method} {request.path}")
             self.logger.debug(f"Content-Type: {request.content_type}")
             self.logger.debug(f"Headers: {dict(request.headers)}")
             if request.is_json:
-                self.logger.debug(f"JSON Data: {request.get_json()}")
+                self.logger.debug(f"JSON Data: {request.get_json(silent=True)}")
             elif request.form:
                 self.logger.debug(f"Form Data: {dict(request.form)}")
             elif request.args:
@@ -270,8 +340,13 @@ class AscomAlpacaSafetyMonitor:
         # Add error handler
         @self.app.errorhandler(Exception)
         def handle_error(error):
+            if isinstance(error, HTTPException):
+                # 404, 405 and friends keep their own status; turning every one
+                # of them into a 500 hid a wrong method or URL behind a "server
+                # error".
+                return error.description or error.name, error.code
             self.logger.error(f"Unhandled error: {error}")
-            return self.get_ascom_response(None, 1, str(error)), 500
+            return self.get_ascom_response(None, ERROR_UNSPECIFIED, str(error)), 500
         @self.app.route('/management/apiversions', methods=['GET'])
         def api_versions():
             """Return supported API versions"""
@@ -373,30 +448,35 @@ class AscomAlpacaSafetyMonitor:
             if request.method == 'GET':
                 return self.get_ascom_response(self.connected)
             else:
+                # Alpaca: a missing or malformed parameter is an HTTP 400 with a
+                # plain-text reason, and must leave the connection state alone.
                 try:
-                    # Get Connected parameter using ASCOM standard
                     connected_value = self.get_request_parameter('Connected', bool)
-                    
-                    if connected_value is not None:
-                        self.connected = connected_value
-                        if self.connected:
-                            self.logger.info("ASCOM client connected")
-                            # Refresh now rather than leaving the client to read a
-                            # flag that is up to one update interval out of date.
-                            self.refresh_safety_status()
-                        else:
-                            # Refreshes stop while disconnected, so drop the flag
-                            # now instead of freezing its last value.
-                            self.is_safe = False
-                            self.last_error = NOT_CONNECTED_MESSAGE
-                            self.logger.info("ASCOM client disconnected")
+                except ValueError as e:
+                    self.logger.warning(f"Rejected Connected value: {e}")
+                    return f"Invalid Connected value: {e}", 400
+                if connected_value is None:
+                    self.logger.warning("No Connected parameter found in request")
+                    return "Missing parameter: Connected", 400
+
+                try:
+                    self.connected = connected_value
+                    if self.connected:
+                        self.logger.info("ASCOM client connected")
+                        # Refresh now rather than leaving the client to read a
+                        # flag that is up to one update interval out of date.
+                        self.refresh_safety_status()
                     else:
-                        self.logger.warning("No Connected parameter found in request")
-                    
+                        # Refreshes stop while disconnected, so drop the flag
+                        # now instead of freezing its last value.
+                        self.is_safe = False
+                        self.last_error = NOT_CONNECTED_MESSAGE
+                        self.logger.info("ASCOM client disconnected")
+
                     return self.get_ascom_response(None)
                 except Exception as e:
                     self.logger.error(f"Error in connected endpoint: {e}")
-                    return self.get_ascom_response(None, 1, str(e))
+                    return self.get_ascom_response(None, ERROR_UNSPECIFIED, str(e))
                     
         @self.app.route(f'{device_base}/issafe', methods=['GET'])
         def is_safe():
@@ -445,9 +525,10 @@ class AscomAlpacaSafetyMonitor:
                 self.logger.info(f"Action requested: {action_name} with parameters: {parameters}")
                 
                 # No actions supported for safety monitor
-                return self.get_ascom_response("", 1, f"Action '{action_name}' is not supported")
+                return self.get_ascom_response(
+                    "", ERROR_ACTION_NOT_IMPLEMENTED, f"Action '{action_name}' is not supported")
             except Exception as e:
-                return self.get_ascom_response("", 1, str(e))
+                return self.get_ascom_response("", ERROR_UNSPECIFIED, str(e))
         
         @self.app.route(f'{device_base}/commandblind', methods=['PUT'])
         def command_blind():
@@ -459,9 +540,10 @@ class AscomAlpacaSafetyMonitor:
                 self.logger.info(f"Blind command: {command}, Raw: {raw}")
                 
                 # No blind commands supported
-                return self.get_ascom_response(None, 1, f"Command '{command}' is not supported")
+                return self.get_ascom_response(
+                    None, ERROR_NOT_IMPLEMENTED, f"Command '{command}' is not supported")
             except Exception as e:
-                return self.get_ascom_response(None, 1, str(e))
+                return self.get_ascom_response(None, ERROR_UNSPECIFIED, str(e))
         
         @self.app.route(f'{device_base}/commandbool', methods=['PUT'])
         def command_bool():
@@ -473,9 +555,10 @@ class AscomAlpacaSafetyMonitor:
                 self.logger.info(f"Bool command: {command}, Raw: {raw}")
                 
                 # No bool commands supported
-                return self.get_ascom_response(False, 1, f"Command '{command}' is not supported")
+                return self.get_ascom_response(
+                    False, ERROR_NOT_IMPLEMENTED, f"Command '{command}' is not supported")
             except Exception as e:
-                return self.get_ascom_response(False, 1, str(e))
+                return self.get_ascom_response(False, ERROR_UNSPECIFIED, str(e))
         
         @self.app.route(f'{device_base}/commandstring', methods=['PUT'])
         def command_string():
@@ -487,9 +570,10 @@ class AscomAlpacaSafetyMonitor:
                 self.logger.info(f"String command: {command}, Raw: {raw}")
                 
                 # No string commands supported
-                return self.get_ascom_response("", 1, f"Command '{command}' is not supported")
+                return self.get_ascom_response(
+                    "", ERROR_NOT_IMPLEMENTED, f"Command '{command}' is not supported")
             except Exception as e:
-                return self.get_ascom_response("", 1, str(e))
+                return self.get_ascom_response("", ERROR_UNSPECIFIED, str(e))
             
         # Additional safety monitor specific methods
         @self.app.route(f'{device_base}/lastupdate', methods=['GET'])
@@ -532,15 +616,15 @@ class AscomAlpacaSafetyMonitor:
         def catch_all_device(device_num, endpoint):
             """Catch-all for unknown device endpoints"""
             self.logger.warning(f"Unknown device endpoint: {request.method} /api/v1/safetymonitor/{device_num}/{endpoint}")
-            self.logger.warning(f"Request data: JSON={request.get_json()}, Form={dict(request.form)}, Args={dict(request.args)}")
-            return self.get_ascom_response(None, 1, f"Unknown endpoint: {endpoint}")
+            self.logger.warning(f"Request data: JSON={request.get_json(silent=True)}, Form={dict(request.form)}, Args={dict(request.args)}")
+            return self.get_ascom_response(None, ERROR_NOT_IMPLEMENTED, f"Unknown endpoint: {endpoint}")
         
         @self.app.route('/<path:path>', methods=['GET', 'PUT', 'POST'])
         def catch_all(path):
             """Catch-all for any unknown endpoints"""
             if not path.startswith('setup'):  # Don't log setup page requests
                 self.logger.warning(f"Unknown endpoint: {request.method} /{path}")
-            return self.get_ascom_response(None, 1, f"Unknown endpoint: /{path}")
+            return self.get_ascom_response(None, ERROR_NOT_IMPLEMENTED, f"Unknown endpoint: /{path}")
             
     def reported_safety(self):
         """Return ``(is_safe, error_message)`` as clients should see it.

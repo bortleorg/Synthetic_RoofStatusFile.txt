@@ -50,6 +50,8 @@ A frame that cannot be read (for example because the camera is still writing it)
 
 The Monitoring tab also shows **"Image last changed: X min ago"** — the elapsed time since the image hash last changed. This turns orange when the image has not changed for longer than the stale threshold (configured in the Notifications tab). The status bar additionally shows a `⚠ stale image` warning in orange when the image is stale.
 
+A stale image is also not trusted for the roof status. A hung camera, a URL serving a cached frame, or capture software that stopped writing hands the classifier the same frame on every pass, and that frame would otherwise be reported (possibly as `OPEN`) all night. Once the image has not changed for the stale threshold, the output file reports `Roof Status: CLOSED (Image unchanged for N min - failsafe)` and ASCOM clients see `CLOSED`, whether or not the stale notification is enabled. A manual override still wins, and the normal status returns with the next new frame.
+
 #### Latest All-Sky Image preview
 
 The Monitoring tab shows a scaled-down preview of the most recent frame, so you can see what the classifier is actually looking at without opening the image folder. It updates on every monitoring cycle, and the caption shows the source file name (or camera URL) and the time it was displayed.
@@ -68,7 +70,7 @@ The **Manual Override** panel forces the reported roof status regardless of what
 While an override is active:
 
 - The output status file reports the forced status, annotated as `(Manual override: OPEN|CLOSED)`. It is written the moment you click **"Apply Override"**, not on the next monitoring cycle, so the file is correct even when monitoring is stopped.
-- ASCOM clients see the forced status.
+- ASCOM clients see the forced status straight away, even while monitoring is stopped. Clearing or expiring an override reports unsafe until the latest image has been re-classified, so the forced status never outlives the override.
 - Clearing an override immediately re-classifies the latest image and rewrites the status file, so the forced line never lingers. (If no model is loaded there is nothing to re-classify, and a warning is logged instead.)
 - The override is written to the settings file, so it survives an app restart. An override whose expiry passed while the app was closed is discarded on the next launch, as is one whose stored expiry is unreadable — a corrupt settings file will never silently turn a timed override into a permanent one.
 - Every applied, expired, and cleared override is logged at `WARNING` level.
@@ -77,7 +79,7 @@ While an override is active:
 
 ### Configuration
 
-**Logging** — Enable file logging and choose a log file path. The log records each classification decision, sun angle, and secondary source status.
+**Logging** — Enable file logging and choose a log file path. The log records each classification decision, sun angle, and secondary source status. The file is rotated at 5 MB with three backups kept (`roof_classifier.log.1` … `.3`). The ASCOM server keeps its own `ascom_alpaca_safety.log` in the working directory, rotated the same way and logged at `INFO`; per-request detail is only logged when `LOG_LEVEL` in `ascom_alpaca_safety.py` is set to `DEBUG`.
 
 **Observatory Location** — Enter your latitude and longitude (decimal degrees). These are used to calculate the sun's current elevation angle.
 
@@ -94,7 +96,7 @@ The calculated observation window (next sunset and sunrise in UTC) is displayed 
 
 The secondary status is shown in the monitoring display and logged alongside each primary classification, but it does not override the primary decision. For URL sources, the last-update time comes from the server's `Last-Modified` header when present, otherwise the time of the fetch, and results are cached for 30 seconds so UI refreshes do not issue a request per redraw.
 
-**ASCOM Alpaca Safety Monitor** — The app can serve an ASCOM Alpaca-compatible Safety Monitor API on a configurable port (default 11111). Enable it here and configure the port and device number. N.I.N.A. and other ASCOM clients can auto-discover the device via UDP port 32227 or connect manually. As the ASCOM SafetyMonitor interface requires, `IsSafe` reads `False` whenever no client has connected the device. Use **"Test Discovery"** to verify the network setup, and **"Open Setup Page"** to view the Alpaca setup endpoint in a browser.
+**ASCOM Alpaca Safety Monitor** — The app can serve an ASCOM Alpaca-compatible Safety Monitor API on a configurable port (default 11111). Enable it here and configure the port and device number. N.I.N.A. and other ASCOM clients can auto-discover the device via UDP port 32227 or connect manually. As the ASCOM SafetyMonitor interface requires, `IsSafe` reads `False` whenever no client has connected the device. The server follows the Alpaca conventions clients rely on: parameter names are case-insensitive, `ClientTransactionID` is echoed (0 when missing or invalid), a missing or malformed `Connected` value is rejected with HTTP 400, and errors use ASCOM error numbers (`0x400` not implemented, `0x40C` action not implemented, `0x4FF` unspecified). Use **"Test Discovery"** to verify the network setup, and **"Open Setup Page"** to view the Alpaca setup endpoint in a browser.
 
 ### Notifications
 
@@ -104,7 +106,7 @@ Webhooks are HTTP POST requests with a JSON body. The `event` field identifies t
 
 | Section | `event` value | Trigger condition |
 |---|---|---|
-| Stale Image | `image_stale` | Image hash unchanged for ≥ stale threshold; re-fires every threshold interval while still stale |
+| Stale Image | `image_stale` | Image hash unchanged for ≥ stale threshold; re-fires every threshold interval while still stale. The reported status is also forced to CLOSED at that point (see Monitoring), so a `roof_closed` event may accompany it |
 | Roof Open | `roof_open` | Status transitions to OPEN (not sent on every cycle) |
 | Roof Closed | `roof_closed` | Status transitions to CLOSED (not sent on every cycle) |
 | Heartbeat | `heartbeat` | Every X minutes while monitoring is active **and** the image is not stale |
@@ -160,8 +162,9 @@ python -m pytest
 The suite covers the parts that run unattended overnight: the roof status file
 writer, settings persistence, the secondary-source parser, the sun-angle safety
 guard, classification caching/locking, the monitor loop and its fail-safe,
-unreadable-image handling, webhook delivery, and the ASCOM safety and discovery
-logic.
+unreadable-image handling, the stale-image fail-safe, manual overrides reaching
+ASCOM, model loading and training checks, log rotation, webhook delivery, and
+the ASCOM safety, discovery and Alpaca protocol logic.
 It needs no display and no camera. CI runs it on every push and pull request,
 and the executable is only built if it passes.
 
@@ -177,5 +180,6 @@ and the executable is only built if it passes.
 - Images should be reasonably consistent in angle and framing.
 - Works best when lighting or exposure is fairly stable across captures.
 - Settings (model path, folder paths, location, thresholds, etc.) are saved automatically to `roof_classifier_settings.json` in the working directory and restored on the next launch. Both this file and the roof status file are written atomically, so a crash or a reader polling the file cannot leave either one half-written. A settings file that is unreadable anyway is moved aside to `roof_classifier_settings.json.corrupt` and defaults are used.
-- Safety decisions fail closed. If the sun altitude cannot be calculated, or the last roof classification is more than three minutes old, the ASCOM `IsSafe` flag reports unsafe rather than assuming the best. The roof status file follows suit after three minutes without a valid classification.
+- Safety decisions fail closed. If the sun altitude cannot be calculated, or the last roof classification is more than three minutes old, the ASCOM `IsSafe` flag reports unsafe rather than assuming the best. The roof status file follows suit after three minutes without a valid classification, and reports `CLOSED` as soon as the camera image has stopped changing for the stale threshold.
+- A model file is checked when it is loaded: one trained at a different image size, or a file that is not a classifier, is rejected with a message instead of failing every monitoring pass. Training requires both open and closed examples.
 - A secondary roof status file is parsed on whole words. A line such as `roof is not open` is treated as unreadable rather than as `OPEN`, and a line mentioning both states is read as `CLOSED`.
