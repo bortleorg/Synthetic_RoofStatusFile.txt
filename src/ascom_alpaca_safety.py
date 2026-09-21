@@ -375,65 +375,70 @@ class AscomAlpacaSafetyMonitor:
         @self.app.route('/setup', methods=['GET'])
         def setup_page():
             """Return a simple setup page for web browsers"""
+            is_safe, reason = self.reported_safety()
+            safe_text = "Safe" if is_safe else "Unsafe"
+            if reason and not is_safe:
+                safe_text += f" ({reason})"
             html = f"""
             <!DOCTYPE html>
-            <html>
+            <html lang="en">
             <head>
-                <title>Synthetic Roof Safety Monitor Setup</title>
+                <meta charset="utf-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <title>Synthetic Roof Safety Monitor</title>
                 <style>
-                    body {{ font-family: Arial, sans-serif; margin: 40px; }}
-                    .info {{ background: #e7f3ff; padding: 15px; border-radius: 5px; margin: 10px 0; }}
-                    .status {{ background: #d4edda; padding: 10px; border-radius: 5px; margin: 10px 0; }}
+                    :root {{ color-scheme: light dark; --muted: #666; --line: #d8d8d8; }}
+                    @media (prefers-color-scheme: dark) {{ :root {{ --muted: #9a9a9a; --line: #3a3a3a; }} }}
+                    body {{ font: 15px/1.5 "Segoe UI", system-ui, sans-serif; max-width: 720px;
+                            margin: 40px auto; padding: 0 20px; }}
+                    h1 {{ font-size: 22px; margin: 0 0 4px; }}
+                    h2 {{ font-size: 15px; margin: 32px 0 8px; }}
+                    .sub {{ color: var(--muted); margin: 0; }}
                     table {{ border-collapse: collapse; width: 100%; }}
-                    th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
-                    th {{ background-color: #f2f2f2; }}
+                    th, td {{ border-bottom: 1px solid var(--line); padding: 7px 0; text-align: left;
+                              vertical-align: top; }}
+                    th {{ width: 40%; font-weight: normal; color: var(--muted); }}
+                    code {{ font-family: Consolas, ui-monospace, monospace; }}
+                    ol, ul {{ padding-left: 20px; }}
                 </style>
             </head>
             <body>
                 <h1>Synthetic Roof Safety Monitor</h1>
-                <div class="info">
-                    <h3>Device Information</h3>
-                    <table>
-                        <tr><th>Property</th><th>Value</th></tr>
-                        <tr><td>Device Name</td><td>{self.device_name}</td></tr>
-                        <tr><td>Device Type</td><td>SafetyMonitor</td></tr>
-                        <tr><td>Device Number</td><td>{self.device_number}</td></tr>
-                        <tr><td>Port</td><td>{self.port}</td></tr>
-                        <tr><td>API Version</td><td>1</td></tr>
-                        <tr><td>Driver Version</td><td>{self.driver_version}</td></tr>
-                    </table>
-                </div>
-                
-                <div class="status">
-                    <h3>Current Status</h3>
-                    <p><strong>Connected:</strong> {self.connected}</p>
-                    <p><strong>Safe:</strong> {self.reported_safety()[0]}</p>
-                    <p><strong>Last Update:</strong> {self.last_update.isoformat()}</p>
-                </div>
-                
-                <div class="info">
-                    <h3>NINA Setup Instructions</h3>
-                    <ol>
-                        <li>In NINA, go to Equipment → Safety Monitor</li>
-                        <li>Choose "ASCOM" as the safety monitor type</li>
-                        <li>Select "Alpaca Safety Monitor" or use discovery</li>
-                        <li>Set IP address to: <strong>localhost</strong> (or this computer's IP)</li>
-                        <li>Set port to: <strong>{self.port}</strong></li>
-                        <li>Set device number to: <strong>{self.device_number}</strong></li>
-                        <li>Click "Connect"</li>
-                    </ol>
-                </div>
-                
-                <div class="info">
-                    <h3>API Endpoints</h3>
-                    <ul>
+                <p class="sub">ASCOM Alpaca safety monitor, driver {self.driver_version}</p>
+
+                <h2>Current status</h2>
+                <table>
+                    <tr><th>Client connected</th><td>{"Yes" if self.connected else "No"}</td></tr>
+                    <tr><th>Reported to clients</th><td>{safe_text}</td></tr>
+                    <tr><th>Last updated</th><td>{self.last_update.strftime("%Y-%m-%d %H:%M:%S")} UTC</td></tr>
+                </table>
+
+                <h2>Device</h2>
+                <table>
+                    <tr><th>Name</th><td>{self.device_name}</td></tr>
+                    <tr><th>Type</th><td>SafetyMonitor</td></tr>
+                    <tr><th>Device number</th><td>{self.device_number}</td></tr>
+                    <tr><th>Port</th><td>{self.port}</td></tr>
+                    <tr><th>API version</th><td>1</td></tr>
+                </table>
+
+                <h2>Connecting from NINA</h2>
+                <ol>
+                    <li>Open Equipment, then Safety Monitor.</li>
+                    <li>Pick this device from the discovered Alpaca devices, or add it by hand
+                        with host <code>localhost</code> (or this computer's address),
+                        port <code>{self.port}</code> and device number <code>{self.device_number}</code>.</li>
+                    <li>Click Connect.</li>
+                </ol>
+
+                <h2>API endpoints</h2>
+                <ul>
                         <li><a href="/management/apiversions">/management/apiversions</a></li>
                         <li><a href="/management/v1/description">/management/v1/description</a></li>
                         <li><a href="/management/v1/configureddevices">/management/v1/configureddevices</a></li>
                         <li><a href="/api/v1/safetymonitor/{self.device_number}/issafe">/api/v1/safetymonitor/{self.device_number}/issafe</a></li>
                         <li><a href="/api/v1/safetymonitor/{self.device_number}/status">/api/v1/safetymonitor/{self.device_number}/status</a></li>
-                    </ul>
-                </div>
+                </ul>
             </body>
             </html>
             """
