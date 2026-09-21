@@ -238,6 +238,8 @@ class RoofClassifierApp:
         self._startup_model_error = None
         # Why the last reported status differs from the model's raw call, if it does
         self._last_status_reason = ""
+        # (status, updated) from the last pass's secondary-source read
+        self._last_secondary = None
         # Window layout remembered between sessions
         self._window_geometry = ""
         self._window_zoomed = False
@@ -537,6 +539,10 @@ class RoofClassifierApp:
         except ValueError:
             if not silent:
                 messagebox.showerror("Invalid ASCOM Settings", "The port and device number must be whole numbers.")
+            elif self.logger:
+                self.logger.error(
+                    f"ASCOM auto-start skipped: invalid port {self.ascom_port.get()!r} "
+                    f"or device number {self.ascom_device_number.get()!r}")
         except Exception as e:
             if not silent:
                 messagebox.showerror("ASCOM Server Error", f"Could not start the ASCOM server: {e}")
@@ -1756,25 +1762,30 @@ class RoofClassifierApp:
         open_count = sum(1 for label in y if label == 1)
         closed_count = sum(1 for label in y if label == 0)
         message = f"Model trained on {open_count} open and {closed_count} closed images."
+        # Things the user needs to act on. A clean run is reported in the status
+        # bar; only these warrant a dialog.
+        notes = []
         if skipped:
-            message += f"\nSkipped {len(skipped)} unreadable image(s): {', '.join(skipped[:5])}"
-            if len(skipped) > 5:
-                message += ", ..."
+            note = f"Skipped {len(skipped)} unreadable image(s): {', '.join(skipped[:5])}"
+            notes.append(note + (", ..." if len(skipped) > 5 else ""))
 
         # Keep the trained model even if saving it fails - it is still usable.
         self.model = clf
         if self.model_path.get():
             try:
                 dump(clf, self.model_path.get())
-                message += f"\nModel saved to {self.model_path.get()}"
+                message += f" Saved to {os.path.basename(self.model_path.get())}."
                 self.save_settings()
             except Exception as e:
-                message += f"\nWARNING: could not save the model to {self.model_path.get()}: {e}"
+                notes.append(f"WARNING: could not save the model to {self.model_path.get()}: {e}")
         else:
-            message += "\n\nThe model has not been saved. Use Save Model As… to keep it."
+            notes.append("The model has not been saved. Use Save Model As… to keep it.")
         self._update_model_display()
         self._render_roof_status()
-        messagebox.showinfo("Model Trained", message)
+        if notes:
+            messagebox.showinfo("Model Trained", message + "\n\n" + "\n\n".join(notes))
+        else:
+            self._set_activity(message)
 
     @staticmethod
     def _load_model_file(path):
@@ -2086,7 +2097,10 @@ class RoofClassifierApp:
 
         # Get secondary source status for comparison
         secondary_status, secondary_time = self.read_secondary_source(config)
-        
+        # Kept for the Monitoring tab, which must not repeat this (possibly
+        # network) read on the UI thread.
+        self._last_secondary = (secondary_status, secondary_time)
+
         # Classify the image
         pred = self.model.predict(img)[0]
         image_status = "OPEN" if pred == 1 else "CLOSED"
@@ -2258,7 +2272,9 @@ class RoofClassifierApp:
         if not self.secondary_source_enabled.get():
             self._set_secondary_line(None)
             return
-        secondary_status, secondary_time = self.read_secondary_source()
+        # The result from the classification pass that just ran, read on its
+        # worker thread; reading again here could block the UI on a slow URL.
+        secondary_status, secondary_time = getattr(self, "_last_secondary", None) or (None, None)
         if secondary_status:
             when = secondary_time.strftime("%H:%M UTC") if secondary_time else "unknown time"
             self._set_secondary_line(
@@ -3226,9 +3242,15 @@ class RoofClassifierApp:
         if path:
             try:
                 dump(self.model, path)
-                self._set_activity(f"Model saved to {path}.")
             except Exception as e:
                 messagebox.showerror("Could Not Save Model", f"Failed to save model: {e}")
+                return
+            # The saved file is now the current model: it is reloaded on startup
+            # and the next training run saves over it.
+            self.model_path.set(path)
+            self.save_settings()
+            self._update_model_display()
+            self._set_activity(f"Model saved to {path}.")
 
     def save_model_as(self):
         """Legacy method - redirects to save_current_model_as for compatibility"""
@@ -3991,8 +4013,9 @@ class RoofClassifierApp:
                         message += f"\n…and {len(errors) - 5} more"
                 self._defer_to_ui(lambda: self._set_activity(
                     f"Converted {converted} of {total_files} FITS files."))
-                show = messagebox.showwarning if errors else messagebox.showinfo
-                self._defer_to_ui(lambda: show("Conversion Complete", message))
+                if errors:
+                    # A clean run is reported in the status bar alone
+                    self._defer_to_ui(lambda: messagebox.showwarning("Conversion Complete", message))
 
             except Exception as e:
                 self._defer_to_ui(lambda e=e: messagebox.showerror(
