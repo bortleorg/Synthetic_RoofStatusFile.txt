@@ -1531,9 +1531,9 @@ class RoofClassifierApp:
             raise ValueError(f"{os.path.basename(path)} is not a classifier model.")
         expected = IMG_SIZE * IMG_SIZE
         n_features = getattr(model, "n_features_in_", None)
-        if n_features is not None and n_features != expected:
+        if n_features != expected:
             raise ValueError(
-                f"{os.path.basename(path)} expects {n_features} input features, but this "
+                f"{os.path.basename(path)} reports {n_features!r} input features, but this "
                 f"app produces {expected} ({IMG_SIZE}x{IMG_SIZE} pixels). Retrain the model.")
         return model
 
