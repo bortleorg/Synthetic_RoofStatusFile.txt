@@ -1,3 +1,4 @@
+import base64
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
@@ -58,8 +59,9 @@ LOG_BACKUP_COUNT = 3
 # Image display size constants
 _CLASSIFY_IMG_MAX_W = 820  # max width in the classify-images window (leaves room for button bar)
 _CLASSIFY_IMG_MAX_H = 460  # max height in the classify-images window
-_PREVIEW_IMG_MAX_W = 460   # max width of the latest-image preview on the Monitoring tab
-_PREVIEW_IMG_MAX_H = 380   # max height (all-sky frames are usually square)
+_PREVIEW_IMG_MAX_W = 460   # initial width of the latest-image panel; the image fills it as it grows
+_PREVIEW_IMG_MAX_H = 380   # initial height (all-sky frames are usually square)
+_PREVIEW_SRC_MAX = 2048    # longest side kept in memory for refitting the preview
 
 # Colours. Only status text is coloured; everything else uses the platform theme.
 COLOR_TEXT = "#1f1f1f"
@@ -174,7 +176,8 @@ class RoofClassifierApp:
         self.preview_enabled = tk.BooleanVar(value=True)
         self._preview_on = True          # plain-bool mirror, readable from the monitor thread
         self._preview_tk_img = None      # keep a reference so Tk does not garbage-collect it
-        self._preview_tmp_path = None    # scaled PNG currently displayed
+        self._preview_src = None         # decoded image being previewed (BGR ndarray)
+        self._preview_resize_job = None  # debounced refit after the panel is resized
         self._preview_busy = False       # guards manual refresh from stacking up
 
         # Cached secondary roof status when the source is an HTTP URL
@@ -1211,6 +1214,8 @@ class RoofClassifierApp:
         self.preview_label = tk.Label(self.preview_holder, text="No image yet",
                                       fg=COLOR_VIEWER_TEXT, bg=COLOR_VIEWER_BG)
         self.preview_label.pack(fill="both", expand=True)
+        # Refit the image whenever the panel changes size (window resize/maximize)
+        self.preview_holder.bind("<Configure>", self._on_preview_resized)
 
         if not self.preview_enabled.get():
             self.preview_holder.pack_forget()
@@ -1537,11 +1542,6 @@ class RoofClassifierApp:
             try:
                 self.ascom_server.stop()
             except Exception:
-                pass
-        if self._preview_tmp_path:
-            try:
-                os.unlink(self._preview_tmp_path)
-            except OSError:
                 pass
         self.root.destroy()
 
@@ -2825,76 +2825,85 @@ class RoofClassifierApp:
             self.preview_caption_label.config(text="Preview hidden", fg=COLOR_MUTED)
 
     def _capture_preview(self, img_path, caption):
-        """Scale *img_path* for the Monitoring-tab preview and hand it to the UI thread.
+        """Decode *img_path* for the Monitoring-tab preview and hand it to the UI thread.
 
-        Safe to call from the monitor thread — the OpenCV work happens here and all Tk
-        work is deferred with root.after.
+        Safe to call from the monitor thread — the decode happens here and all Tk
+        work is deferred with root.after. The UI thread fits the image to the panel.
         """
         # _preview_on mirrors the checkbox as a plain bool: this runs on the monitor
         # thread, which must not touch Tk variables.
         if not hasattr(self, "preview_label") or not self._preview_on:
             return
-        tmp_path = None
         try:
             img = cv2.imread(img_path)
             if img is None:
                 return
+            # Bound the kept copy: no screen needs more, and every refit rescales it.
             h, w = img.shape[:2]
-            max_w, max_h = getattr(self, "_preview_max", (_PREVIEW_IMG_MAX_W, _PREVIEW_IMG_MAX_H))
-            scale = min(max_w / w, max_h / h, 1.0)
-            disp = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))))
-            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".png")
-            os.close(tmp_fd)
-            cv2.imwrite(tmp_path, disp)
+            scale = min(_PREVIEW_SRC_MAX / max(w, h), 1.0)
+            if scale < 1.0:
+                img = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))),
+                                 interpolation=cv2.INTER_AREA)
         except Exception as e:
             if self.logger:
                 self.logger.warning(f"Could not build preview image for {img_path}: {e}")
-            if tmp_path:
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
             return
 
         try:
-            self.root.after(0, self._apply_preview, tmp_path, caption)
+            self.root.after(0, self._apply_preview, img, caption)
         except Exception:
-            # The window is going away — drop the prepared image
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+            pass  # The window is going away
 
-    def _apply_preview(self, tmp_path, caption):
-        """Display a prepared preview image (UI thread only)."""
+    def _apply_preview(self, img, caption):
+        """Display a newly decoded preview image (UI thread only)."""
         if not hasattr(self, "preview_label"):
             return
-        try:
-            tk_img = tk.PhotoImage(file=tmp_path)
-        except Exception:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            return
-
-        previous = self._preview_tmp_path
-        self._preview_tk_img = tk_img          # keep a reference alive for Tk
-        self._preview_tmp_path = tmp_path
-        # width/height are character cells for a text label but pixels for an image
-        # label, so they must be restated in pixels or the image is clipped.
-        self.preview_label.config(image=tk_img, text="",
-                                  width=tk_img.width(), height=tk_img.height())
+        self._preview_src = img
+        self._render_preview()
         self.preview_caption_label.config(
             text=f"{self._short_source(caption, 56)}  ·  {datetime.now().strftime('%H:%M:%S')}",
             fg=COLOR_MUTED,
         )
 
-        if previous and previous != tmp_path:
-            try:
-                os.unlink(previous)
-            except OSError:
-                pass
+    def _on_preview_resized(self, _event=None):
+        """Refit the preview after the panel settles at a new size (debounced)."""
+        if self._preview_resize_job is not None:
+            self.root.after_cancel(self._preview_resize_job)
+        self._preview_resize_job = self.root.after(120, self._render_preview)
+
+    def _render_preview(self):
+        """Scale the current preview image to fill the panel, keeping its aspect ratio."""
+        # A new frame can arrive while a resize refit is queued; drop the queued one
+        # rather than orphaning it (cancelling a job that already fired is harmless).
+        if self._preview_resize_job is not None:
+            self.root.after_cancel(self._preview_resize_job)
+            self._preview_resize_job = None
+        img = self._preview_src
+        if img is None:
+            return
+        # Leave room for the label's border and padding so the image is never clipped
+        avail_w = self.preview_holder.winfo_width() - 6
+        avail_h = self.preview_holder.winfo_height() - 6
+        if avail_w < 16 or avail_h < 16:
+            return  # not laid out yet; the <Configure> binding will call back
+        h, w = img.shape[:2]
+        scale = min(avail_w / w, avail_h / h)
+        size = (max(1, int(w * scale)), max(1, int(h * scale)))
+        interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+        try:
+            ok, png = cv2.imencode(".png", cv2.resize(img, size, interpolation=interp))
+            if not ok:
+                return
+            tk_img = tk.PhotoImage(data=base64.b64encode(png.tobytes()))
+        except Exception as e:
+            if self.logger:
+                self.logger.warning(f"Could not render preview image: {e}")
+            return
+        self._preview_tk_img = tk_img          # keep a reference alive for Tk
+        # width/height are character cells for a text label but pixels for an image
+        # label, so they must be restated in pixels or the image is clipped.
+        self.preview_label.config(image=tk_img, text="",
+                                  width=tk_img.width(), height=tk_img.height())
 
     def refresh_preview(self):
         """Fetch and display the latest image on demand (button handler)."""
