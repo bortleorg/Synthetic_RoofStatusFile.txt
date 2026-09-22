@@ -2873,7 +2873,11 @@ class RoofClassifierApp:
 
     def _render_preview(self):
         """Scale the current preview image to fill the panel, keeping its aspect ratio."""
-        self._preview_resize_job = None
+        # A new frame can arrive while a resize refit is queued; drop the queued one
+        # rather than orphaning it (cancelling a job that already fired is harmless).
+        if self._preview_resize_job is not None:
+            self.root.after_cancel(self._preview_resize_job)
+            self._preview_resize_job = None
         img = self._preview_src
         if img is None:
             return
